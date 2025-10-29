@@ -96,7 +96,7 @@
             (not (is_pacman ?a))
             (not (is_pacman ?e1))
             (not (is_pacman ?e2))
-            (winning_gt10)
+            (winning_gt5)
         )
         :effect (and 
             (defend_foods)

@@ -349,7 +349,7 @@ class MixedAgent(CaptureAgent):
     def getGoals(self, objects: List[Tuple], initState: List[Tuple]):
         # Check a list of goal functions from high priority to low priority if the goal is applicable
         # Return the pddl goal states for selected goal function
-        if (("winning_gt10",) in initState):
+        if (("winning_gt5",) in initState):
             return self.goalDefWinning(objects, initState)
         else:
             return self.goalScoring(objects, initState)
@@ -562,19 +562,34 @@ class MixedAgent(CaptureAgent):
         features["#-of-ghosts-1-step-away"] = sum((next_x, next_y) in Actions.getLegalNeighbors(g, walls) for g in ghosts) 
         
         
-        dist_home =  self.getMazeDistance((next_x, next_y), gameState.getInitialAgentPosition(self.index))+1
+        dist_home = self.getMazeDistance((next_x, next_y), gameState.getInitialAgentPosition(self.index))+1
 
         features["chance-return-food"] = (currAgentState.numCarrying)*(1 - dist_home/(walls.width+walls.height)) # The closer to home, the larger food carried, more chance return food
-        
-        # Closest food
-        dist = self.closestFood((next_x, next_y), food, walls)
-        if dist is not None:
+                 
+        teamIndices = self.getTeam(gameState)
+        if self.index == teamIndices[0]:
+            # 把最靠上边的食物作为目标
+            food_list = self.getFood(gameState).asList()
+            if len(food_list) > 0:
+                top_food = max(food_list, key=lambda x: x[1])
+                dist = self.getMazeDistance((next_x, next_y), top_food)
+                if dist is not None:
+                    # make the distance a number less than one otherwise the update
+                    # will diverge wildly
+                    features["closest-food"] = dist/(walls.width+walls.height)
+                else:
+                    features["closest-food"] = 0
+            else:
+                features["closest-food"] = 0
+        else:
+            # agent 2 目标食物为 Closest food
+            dist = self.closestFood((next_x, next_y), food, walls)
+            if dist is not None:
                 # make the distance a number less than one otherwise the update
                 # will diverge wildly
                 features["closest-food"] = dist/(walls.width+walls.height)
-        else:
-            features["closest-food"] = 0
-
+            else:
+                features["closest-food"] = 0
         return features
 
     def getOffensiveWeights(self):
