@@ -31,6 +31,7 @@ from capture import GameState, noisyDistance
 from game import Directions, Actions, AgentState, Agent
 from util import nearestPoint
 import sys,os
+import json
 
 # the folder of current file.
 BASE_FOLDER = os.path.dirname(os.path.abspath(__file__))
@@ -80,19 +81,35 @@ class MixedAgent(CaptureAgent):
     # You should add your weights for new low level planner here as well.
     # weights are defined as class attribute here, so taht agents share same weights.
     QLWeights = {
-            "offensiveWeights":{'closest-food': -1, 
-                                        'bias': 1, 
-                                        '#-of-ghosts-1-step-away': -100, 
-                                        'successorScore': 100, 
-                                        'chance-return-food': 10,
-                                        },
-            "defensiveWeights": {'numInvaders': -1000, 'onDefense': 100,'teamDistance':2 ,'invaderDistance': -10, 'stop': -100, 'reverse': -2},
-            "escapeWeights": {'onDefense': 1000, 'enemyDistance': 30, 'stop': -100, 'distanceToHome': -20}
+        "offensiveWeights": {
+           'closest-food': -1, 
+            'bias': 1, 
+            '#-of-ghosts-1-step-away': -100, 
+            'successorScore': 100, 
+            'chance-return-food': 10,
+        },
+        "defensiveWeights": {
+            "numInvaders": -1000,
+            "onDefense": 100,
+            "teamDistance": 2,
+            "invaderDistance": -10,
+            "stop": -100,
+            "reverse": -2
+        },
+        "escapeWeights": {
+            "onDefense": 1000,
+            "enemyDistance": 30,
+            "stop": -100,
+            "distanceToHome": -20
         }
+    }
     QLWeightsFile = BASE_FOLDER+'/QLWeightsMyTeam.txt'
 
     # Also can use class variable to exchange information between agents.
     CURRENT_ACTION = {}
+    
+    # 添加训练监控器（类变量，所有agent共享）
+    monitor = None
 
 
     def registerInitialState(self, gameState: GameState):
@@ -109,9 +126,9 @@ class MixedAgent(CaptureAgent):
         self.lowLevelActionIndex = 0
 
         # REMEMBER TRUN TRAINNING TO FALSE when submit to contest server.
-        self.trainning = False # trainning mode to true will keep update weights and generate random movements by prob.
-        self.epsilon = 0.05 #default exploration prob, change to take a random step
-        self.alpha = 0.1 #default learning rate
+        self.trainning = True # trainning mode to true will keep update weights and generate random movements by prob.
+        self.epsilon = 0.1 #default exploration prob, change to take a random step
+        self.alpha = 0.2 #default learning rate
         self.discountRate = 0.9 # default discount rate on successor state q value when update
         
         # Use a dictionary to save information about current agent.
@@ -135,9 +152,9 @@ class MixedAgent(CaptureAgent):
         if self.trainning:
             print("Write QLWeights:", MixedAgent.QLWeights)
             file = open(MixedAgent.QLWeightsFile, 'w')
-            file.write(str(MixedAgent.QLWeights))
+            file.write(json.dumps(MixedAgent.QLWeights, indent=4))
             file.close()
-    
+
 
     def chooseAction(self, gameState: GameState):
         """
@@ -153,7 +170,7 @@ class MixedAgent(CaptureAgent):
 
         # Collect objects and init states from gameState
         objects, initState = self.get_pddl_state(gameState)
-        positiveGoal, negtiveGoal = self.getGoals(objects,initState)
+        positiveGoal, negtiveGoal = self.getGoals(objects,initState, gameState)
 
         # Check if we can stick to current plan 
         if not self.stateSatisfyCurrentPlan(initState, positiveGoal, negtiveGoal):
@@ -281,6 +298,8 @@ class MixedAgent(CaptureAgent):
                     states.append(("5_food_in_backpack",agent_object))
                 if agent_state.numCarrying >=3 :
                     states.append(("3_food_in_backpack",agent_object))
+                if agent_state.numCarrying >=2 :
+                    states.append(("2_food_in_backpack",agent_object))
                 
             if agent_state.isPacman:
                 states.append(("is_pacman",agent_object))
@@ -346,31 +365,51 @@ class MixedAgent(CaptureAgent):
         # Current action precondition not satisfied anymore, need new plan
         return False
     
-    def getGoals(self, objects: List[Tuple], initState: List[Tuple]):
+    def getGoals(self, objects: List[Tuple], initState: List[Tuple], gameState: GameState):
         # Check a list of goal functions from high priority to low priority if the goal is applicable
         # Return the pddl goal states for selected goal function
         if (("winning_gt10",) in initState):
-            return self.goalDefWinning(objects, initState)
+            return self.goalDefWinning(objects, initState, )
         else:
-            return self.goalScoring(objects, initState)
+            return self.goalScoring(objects, initState, gameState)
 
-    def goalScoring(self,objects: List[Tuple], initState: List[Tuple]):
+    def goalScoring(self,objects: List[Tuple], initState: List[Tuple], gameState: GameState):
         # If we are not winning more than 5 points,
         # we invate enemy land and eat foods, and bring then back.
 
         positiveGoal = []
-        negtiveGoal = [("food_available",)] # no food avaliable means eat all the food
+        negtiveGoal = []
 
+        # Check if our agent has 2 or more food - priority to return home 获取我方agent对象
+        current_agent_obj = None
         for obj in objects:
-            agent_obj = obj[0]
-            agent_type = obj[1]
-            
-            if agent_type == "enemy1" or agent_type == "enemy2":
-                negtiveGoal += [("is_pacman", agent_obj)] # no enemy should standing on our land.
+            if obj[1] == "current_agent":
+                current_agent_obj = obj[0]
+                break
         
+        if current_agent_obj and ("2_food_in_backpack", current_agent_obj) in initState:
+            # Agent has 2+ food, priority is to return home
+            positiveGoal = [not ("is_pacman", current_agent_obj)]
+            negtiveGoal = [("is_pacman", current_agent_obj)] # 让当前agent不要成为pacman == 回家 
+        elif current_agent_obj and ("food_available",) in initState and self.getScore(gameState) < 5: 
+            # 没有领先至少5分，且还有食物可以吃，则进攻
+            # Still have food to eat, set goal to eat all food
+            negtiveGoal = [("food_available",)] # 还有食物可以吃，则吃掉所有食物
+        elif not ("food_available",) in initState:
+            # 没食物可以吃，全部agents专心防守
+            negtiveGoal = [("is_pacman", current_agent_obj) for obj in objects if obj[1] == "current_agent" or obj[1] == "ally"]
+        else:
+            # Always prevent enemies from being pacman on our land
+            for obj in objects:
+                agent_obj = obj[0]
+                agent_type = obj[1]
+                
+                if agent_type == "enemy1" or agent_type == "enemy2":
+                    negtiveGoal += [("is_pacman", agent_obj)] # no enemy should standing on our land.
+
         return positiveGoal, negtiveGoal
 
-    def goalDefWinning(self,objects: List[Tuple], initState: List[Tuple]):
+    def goalDefWinning(self,objects: List[Tuple], initState: List[Tuple], gameState: GameState):
         # If winning greater than 5 points,
         # this example want defend foods only, and let agents patrol on our ground.
         # The "win_the_game" pddl state is only reachable by the "patrol" action in pddl,
@@ -433,19 +472,17 @@ class MixedAgent(CaptureAgent):
             weights = self.getOffensiveWeights()
             learningRate = self.alpha
         elif highLevelAction == "go_home":
-            # The q learning process for escape actions are NOT complete,
-            # Introduce more features and complete the q learning process
+            # The q learning process for escape actions are now complete
             rewardFunction = self.getEscapeReward
             featureFunction = self.getEscapeFeatures
             weights = self.getEscapeWeights()
-            learningRate = 0 # learning rate set to 0 as reward function not implemented for this action, do not do q update, 
+            learningRate = self.alpha  # Enable learning for escape actions 
         else:
-            # The q learning process for defensive actions are NOT complete,
-            # Introduce more features and complete the q learning process
+            # The q learning process for defensive actions are now complete
             rewardFunction = self.getDefensiveReward
             featureFunction = self.getDefensiveFeatures
             weights = self.getDefensiveWeights()
-            learningRate = 0 # learning rate set to 0 as reward function not implemented for this action, do not do q update 
+            learningRate = self.alpha  # Enable learning for defensive actions 
 
         if len(legalActions) != 0:
             prob = util.flipCoin(self.epsilon) # get change of perform random movement
@@ -524,13 +561,110 @@ class MixedAgent(CaptureAgent):
         print("Agent ", self.index," reward ",base_reward)
         return base_reward
     
-    def getDefensiveReward(self,gameState, nextState):
-        print("Warnning: DefensiveReward not implemented yet, and learnning rate is 0 for defensive ",file=sys.stderr)
-        return 0
+    def getDefensiveReward(self, gameState: GameState, nextState: GameState):
+        # Calculate defensive reward
+        currentAgentState: AgentState = gameState.getAgentState(self.index)
+        nextAgentState: AgentState = nextState.getAgentState(self.index)
+        
+        # Get invaders information
+        enemies = [nextState.getAgentState(i) for i in self.getOpponents(nextState)]
+        invaders = [a for a in enemies if a.isPacman and a.getPosition() != None]
+        prevInvaders = [a for a in [gameState.getAgentState(i) for i in self.getOpponents(gameState)] 
+                       if a.isPacman and a.getPosition() != None]
+        
+        base_reward = 0
+        
+        # Reward for being on defense
+        if not nextAgentState.isPacman:
+            base_reward += 10
+        else:
+            base_reward -= 20  # Penalty for leaving defense position
+        
+        # Reward for reducing number of invaders (catching them)
+        invaders_caught = len(prevInvaders) - len(invaders)
+        if invaders_caught > 0:
+            base_reward += 100 * invaders_caught  # Big reward for catching invaders
+        
+        # Penalty for having invaders
+        base_reward -= 10 * len(invaders)
+        
+        # Reward for being close to invaders when defending
+        myPos = nextAgentState.getPosition()
+        if len(invaders) > 0 and not nextAgentState.isPacman:
+            min_invader_dist = min([self.getMazeDistance(myPos, inv.getPosition()) for inv in invaders])
+            base_reward += (10 - min_invader_dist)  # Closer to invader is better
+        
+        # Check food defense
+        foodDefending = self.getFoodYouAreDefending(nextState).asList()
+        prevFoodDefending = self.getFoodYouAreDefending(gameState).asList()
+        foodLost = len(prevFoodDefending) - len(foodDefending)
+        if foodLost > 0:
+            base_reward -= 50 * foodLost  # Big penalty for losing food
+        
+        # Small penalty for stopping
+        if nextAgentState.getPosition() == currentAgentState.getPosition():
+            base_reward -= 5
+        
+        print("Agent", self.index, "defensive reward", base_reward)
+        return base_reward
     
-    def getEscapeReward(self,gameState, nextState):
-        print("Warnning: EscapeReward not implemented yet, and learnning rate is 0 for escape",file=sys.stderr)
-        return 0
+    def getEscapeReward(self, gameState: GameState, nextState: GameState):
+        # Calculate escape reward
+        currentAgentState: AgentState = gameState.getAgentState(self.index)
+        nextAgentState: AgentState = nextState.getAgentState(self.index)
+        
+        base_reward = 0
+        
+        # Get enemy ghost positions
+        enemies = [nextState.getAgentState(i) for i in self.getOpponents(nextState)]
+        ghosts = [a for a in enemies if not a.isPacman and a.getPosition() != None]
+        
+        myPos = nextAgentState.getPosition()
+        homePos = self.startPosition
+        
+        # Big reward for successfully returning home with food
+        if not nextAgentState.isPacman and currentAgentState.isPacman:
+            food_returned = nextAgentState.numReturned - currentAgentState.numReturned
+            if food_returned > 0:
+                base_reward += 200 * food_returned  # Huge reward for bringing food home
+        
+        # Reward for getting closer to home when carrying food
+        if currentAgentState.isPacman and currentAgentState.numCarrying > 0:
+            curr_home_dist = self.getMazeDistance(gameState.getAgentPosition(self.index), homePos)
+            next_home_dist = self.getMazeDistance(myPos, homePos)
+            
+            if next_home_dist < curr_home_dist:
+                base_reward += 15  # Reward for moving towards home
+            else:
+                base_reward -= 10  # Penalty for moving away from home
+        
+        # Penalty for being close to ghosts
+        if len(ghosts) > 0:
+            ghost_distances = [self.getMazeDistance(myPos, g.getPosition()) for g in ghosts]
+            min_ghost_dist = min(ghost_distances)
+            
+            if min_ghost_dist <= 1:
+                base_reward -= 100  # Very bad to be adjacent to ghost
+            elif min_ghost_dist <= 3:
+                base_reward -= 30  # Bad to be very close
+            elif min_ghost_dist <= 5:
+                base_reward -= 10  # Still want to keep distance
+            else:
+                base_reward += 5  # Good to be far from ghosts
+        
+        # Penalty for dying (losing food)
+        if nextAgentState.numCarrying == 0 and currentAgentState.numCarrying > 0 and nextAgentState.numReturned == currentAgentState.numReturned:
+            base_reward -= 200  # Big penalty for losing carried food
+        
+        # Small bonus for carrying food (encourages collecting before escaping)
+        base_reward += currentAgentState.numCarrying * 2
+        
+        # Penalty for stopping
+        if myPos == currentAgentState.getPosition():
+            base_reward -= 15
+        
+        print("Agent", self.index, "escape reward", base_reward)
+        return base_reward
 
 
 
@@ -593,22 +727,28 @@ class MixedAgent(CaptureAgent):
         features['onDefense'] = 1
         if myState.isPacman: features['onDefense'] = 0
 
-        # Computes distance to invaders we can see
+        # Distance to home (normalized)
+        distanceToHome = self.getMazeDistance(myPos, self.startPosition)
+        features['distanceToHome'] = distanceToHome / (gameState.data.layout.width + gameState.data.layout.height)
+
+        # Computes distance to enemies (ghosts) we can see
         enemies = [successor.getAgentState(i) for i in self.getOpponents(successor)]
         enemiesAround = [a for a in enemies if not a.isPacman and a.getPosition() != None]
+        
         if len(enemiesAround) > 0:
             dists = [self.getMazeDistance(myPos, a.getPosition()) for a in enemiesAround]
-            features['enemyDistance'] = min(dists)
-
+            minDist = min(dists)
+            features['enemyDistance'] = minDist / (gameState.data.layout.width + gameState.data.layout.height)
+        else:
+            features['enemyDistance'] = 1.0  # Max distance if no enemy visible
+        
+        # Penalty features
         if action == Directions.STOP: features['stop'] = 1
-        features["distanceToHome"] = self.getMazeDistance(myPos,self.startPosition)
 
         return features
 
     def getEscapeWeights(self):
         return MixedAgent.QLWeights["escapeWeights"]
-    
-
 
     def getDefensiveFeatures(self, gameState, action):
         features = util.Counter()
@@ -621,18 +761,23 @@ class MixedAgent(CaptureAgent):
         features['onDefense'] = 1
         if myState.isPacman: features['onDefense'] = 0
 
+        # Team coordination - prefer spreading out
         team = [successor.getAgentState(i) for i in self.getTeam(successor)]
         team_dist = self.getMazeDistance(team[0].getPosition(), team[1].getPosition())
-        features['teamDistance'] = team_dist
+        features['teamDistance'] = team_dist / (gameState.data.layout.width + gameState.data.layout.height)
 
         # Computes distance to invaders we can see
         enemies = [successor.getAgentState(i) for i in self.getOpponents(successor)]
         invaders = [a for a in enemies if a.isPacman and a.getPosition() != None]
         features['numInvaders'] = len(invaders)
+        
         if len(invaders) > 0:
             dists = [self.getMazeDistance(myPos, a.getPosition()) for a in invaders]
-            features['invaderDistance'] = min(dists)
-
+            features['invaderDistance'] = min(dists) / (gameState.data.layout.width + gameState.data.layout.height)
+        else:
+            features['invaderDistance'] = 0
+        
+        # Penalty features
         if action == Directions.STOP: features['stop'] = 1
         rev = Directions.REVERSE[gameState.getAgentState(self.index).configuration.direction]
         if action == rev: features['reverse'] = 1
