@@ -438,7 +438,7 @@ class MixedAgent(CaptureAgent):
             rewardFunction = self.getEscapeReward
             featureFunction = self.getEscapeFeatures
             weights = self.getEscapeWeights()
-            learningRate = 0 # learning rate set to 0 as reward function not implemented for this action, do not do q update, 
+            learningRate = self.alpha # learning rate set to 0 as reward function not implemented for this action, do not do q update, 
         else:
             # The q learning process for defensive actions are NOT complete,
             # Introduce more features and complete the q learning process
@@ -514,12 +514,16 @@ class MixedAgent(CaptureAgent):
         score = self.getScore(nextState)
 
         if ghost_1_step > 0:
-            base_reward -= 5
+            base_reward -= 100 # 5 -> 100
         if score <0:
             base_reward += score
         if new_food_returned > 0:
             # return home with food get reward score
             base_reward += new_food_returned*10
+        
+        # 装鬼惩罚
+        if nextAgentState.getPosition() in ghosts:
+            base_reward -= 100
         
         print("Agent ", self.index," reward ",base_reward)
         return base_reward
@@ -529,8 +533,30 @@ class MixedAgent(CaptureAgent):
         return 0
     
     def getEscapeReward(self,gameState, nextState):
-        print("Warnning: EscapeReward not implemented yet, and learnning rate is 0 for escape",file=sys.stderr)
-        return 0
+        currentAgentState:AgentState = gameState.getAgentState(self.index)
+        nextAgentState:AgentState = nextState.getAgentState(self.index)
+
+        ghosts = self.getGhostLocs(gameState)
+        ghost_1_step = sum(nextAgentState.getPosition() in Actions.getLegalNeighbors(g,gameState.getWalls()) for g in ghosts)
+
+        base_reward =  -50 + nextAgentState.numReturned + nextAgentState.numCarrying
+        new_food_returned = nextAgentState.numReturned - currentAgentState.numReturned
+        next_num_carrying = nextAgentState.numCarrying 
+
+        if ghost_1_step > 0:
+            base_reward -= 100 # 5 -> 100
+        if next_num_carrying > currentAgentState.numCarrying:
+            base_reward += 10
+        if new_food_returned > 0:
+            # return home with food get reward score
+            base_reward += new_food_returned*10
+        
+        # 装鬼惩罚
+        if nextAgentState.getPosition() in ghosts:
+            base_reward -= 100
+        
+        print("Agent ", self.index," reward ",base_reward)
+        return base_reward
 
 
 
@@ -590,6 +616,12 @@ class MixedAgent(CaptureAgent):
                 features["closest-food"] = dist/(walls.width+walls.height)
             else:
                 features["closest-food"] = 0
+                
+        # 新增撞上鬼的的feature, 如果撞上鬼，则惩罚100
+        if nextState.getAgentPosition(self.index) in ghosts:
+            features["crash-ghost"] = 1
+        else:
+            features["crash-ghost"] = 0
         return features
 
     def getOffensiveWeights(self):
@@ -616,8 +648,36 @@ class MixedAgent(CaptureAgent):
             features['enemyDistance'] = min(dists)
 
         if action == Directions.STOP: features['stop'] = 1
-        features["distanceToHome"] = self.getMazeDistance(myPos,self.startPosition)
+        
+        # 计算当前位置到我方领地最近点的距离
+        walls = gameState.getWalls()
+        minHomeDist = float('inf')
+        myX, myY = int(myPos[0]), int(myPos[1])
+        width = walls.width
+        height = walls.height
 
+        isRed = self.red
+        # 找所有属于本方领地的点（x小于宽度//2为红方，大于等于则为蓝方）
+        for x in range(width):
+            for y in range(height):
+                if not walls[x][y]:
+                    if isRed and x < (width // 2):
+                        home = (x, y)
+                    elif not isRed and x >= (width // 2):
+                        home = (x, y)
+                    else:
+                        continue
+                    dist = self.getMazeDistance(myPos, home)
+                    if dist < minHomeDist:
+                        minHomeDist = dist
+        features["distanceToHome"] = minHomeDist if minHomeDist != float('inf') else 0
+
+        # 撞鬼惩罚
+        ghosts = self.getGhostLocs(gameState)
+        if myPos in ghosts:
+            features["crash-ghost"] = 1
+        else:
+            features["crash-ghost"] = 0
         return features
 
     def getEscapeWeights(self):
