@@ -445,7 +445,7 @@ class MixedAgent(CaptureAgent):
             rewardFunction = self.getDefensiveReward
             featureFunction = self.getDefensiveFeatures
             weights = self.getDefensiveWeights()
-            learningRate = self.alpha # learning rate set to 0 as reward function not implemented for this action, do not do q update 
+            learningRate = 0 # learning rate set to 0 as reward function not implemented for this action, do not do q update 
 
         if len(legalActions) != 0:
             prob = util.flipCoin(self.epsilon) # get change of perform random movement
@@ -528,130 +528,9 @@ class MixedAgent(CaptureAgent):
         print("Agent ", self.index," reward ",base_reward)
         return base_reward
     
-    def getDefensiveReward(self, prevState, nextState):
-        """
-        防守 Reward（含 scared-aware）：
-        - 每步小负
-        - 我方食物被吃：强罚
-        - 正常鬼：逼近入侵者小奖、抓到强奖
-        - scared 鬼：远离入侵者小奖、近身强罚（避免被吃），占位在自家半场要道
-        - 越界罚、站桩罚
-        """
-        # ------- 常量（可按表现微调） -------
-        BASER = -1            # 每步小负
-        FOOD_LOST = -10         # 我方食物丢失罚
-        CAPTURE = +50.0          # 抓到/驱散入侵者奖（正常鬼时期）
-        APPROACH = +1          # 正常鬼：逼近 shaping
-        RETREAT = +1           # scared：远离 shaping（数值对称）
-        CLOSE_DANGER_PEN = -3.0  # scared：入侵者≤2格 强罚（避免被吃）
-        LEAVE_HOME = -100        # 防守越界罚
-        STOP_PEN = -1          # 站桩罚
-        BORDER_SHAPE = 0.05      # 无可见入侵者时贴近边界的小正
-        CHOKEPOINT_SHAPE = 1  # scared 时靠近“要道/边界”的小正
-        SAFE_BUFFER = 3          # scared 目标安全距离（与入侵者至少相隔 ~3）
-
-        r = 0.0
-        r += BASER
-
-        myPrev = prevState.getAgentState(self.index)
-        myNext = nextState.getAgentState(self.index)
-        i_am_scared = (myNext.scaredTimer or 0) > 0  # 下一个状态是否是 scared
-
-        # ---- 0) 我方食物是否被吃（强罚）----
-        prevFood = len(self.getFood(prevState).asList())
-        nextFood = len(self.getFood(nextState).asList())
-        lost = prevFood - nextFood
-        if lost > 0:
-            r += FOOD_LOST * lost
-
-        # ---- 辅助：可见入侵者 & 最近距离 ----
-        def visible_invaders(s):
-            inv = []
-            for opp in self.getOpponents(s):
-                st = s.getAgentState(opp)
-                if st.isPacman and st.getPosition() is not None:
-                    inv.append(st)
-            return inv
-
-        def closest_invader_dist(s):
-            myPos = s.getAgentPosition(self.index)
-            if myPos is None:
-                return None
-            inv = visible_invaders(s)
-            if not inv:
-                return None
-            dists = [self.getMazeDistance(myPos, st.getPosition()) for st in inv]
-            return min(dists)
-        
-        def _homeBorderXs(self, state):
-            walls = state.getWalls()
-            mid = walls.width // 2
-            if self.red:
-                return {mid - 1}
-            else:
-                return {mid}
-
-        prevInv = visible_invaders(prevState)
-        nextInv = visible_invaders(nextState)
-
-        d_prev = closest_invader_dist(prevState)
-        d_next = closest_invader_dist(nextState)
-
-        # ---- 1) 抓到/驱散入侵者（只有正常鬼期才计强奖）----
-        if not i_am_scared and len(nextInv) < len(prevInv):
-            r += CAPTURE
-
-        # ---- 2) 距离 shaping：正常鬼逼近 / scared 远离 ----
-        if d_prev is not None and d_next is not None:
-            if i_am_scared:
-                # scared：离得更远更好
-                r += RETREAT * (d_next - d_prev)  # 变远>0 → 正奖
-                # 近身强罚（防被吃）
-                if d_next <= SAFE_BUFFER:
-                    r += CLOSE_DANGER_PEN * (SAFE_BUFFER - d_next + 1)
-            else:
-                # 正常：靠近入侵者
-                r += APPROACH * (d_prev - d_next)  # 变近>0 → 正奖
-
-        # ---- 3) 防守越界（不该去敌区）----
-        if myNext.isPacman:
-            r += LEAVE_HOME
-
-        # ---- 4) 占位倾向 ----
-        # 没有可见入侵者：作为门神，靠近边界一点（方便拦截）
-        if d_next is None:
-            # 没有可见入侵者：作为门神，靠近边界一点（方便拦截）
-            myPos = nextState.getAgentPosition(self.index)
-            if myPos is not None:
-                borderXs = _homeBorderXs(self, nextState)
-                dist_to_border = []
-                for bx in borderXs:
-                    if not nextState.getWalls()[bx][myPos[1]]:
-                        dist_to_border.append(self.getMazeDistance(myPos, (bx, myPos[1])))
-                if len(dist_to_border) > 0:
-                    dborder = min(dist_to_border)
-                    # 既不远离要道太多（保持可回收位），也别贴脸
-                    # 用一个温和 shaping：越靠近边界奖励越高
-                    r += -CHOKEPOINT_SHAPE * dborder
-                    if dborder <= SAFE_BUFFER:
-                        r += CLOSE_DANGER_PEN * (SAFE_BUFFER - dborder + 1)
-        else:
-            # 有入侵者但我被 scared：靠近入侵者，但保持安全距离（风筝占位）
-            if i_am_scared:
-                myPos = nextState.getAgentPosition(self.index)
-                if myPos is not None:
-                    invaders = visible_invaders(nextState)
-                    if len(invaders) > 0:
-                        closest_invader = min(invaders, key=lambda x: self.getMazeDistance(myPos, x.getPosition()))
-                        r += APPROACH * (self.getMazeDistance(myPos, closest_invader.getPosition()) - d_next)
-                        if self.getMazeDistance(myPos, closest_invader.getPosition()) <= SAFE_BUFFER:
-                            r += CLOSE_DANGER_PEN * (SAFE_BUFFER - self.getMazeDistance(myPos, closest_invader.getPosition()) + 1)
-
-        # ---- 5) 别站桩 ----
-        if nextState.getAgentState(self.index).getPosition() == prevState.getAgentState(self.index).getPosition():
-            r += STOP_PEN
-
-        return r
+    def getDefensiveReward(self,gameState, nextState):
+        print("Warnning: DefensiveReward not implemented yet, and learnning rate is 0 for defensive ",file=sys.stderr)
+        return 0
     
     def getEscapeReward(self,gameState, nextState):
         currentAgentState:AgentState = gameState.getAgentState(self.index)
@@ -817,41 +696,22 @@ class MixedAgent(CaptureAgent):
         features['onDefense'] = 1
         if myState.isPacman: features['onDefense'] = 0
 
-        # 获取地图宽高，用于归一化特征
-        walls = successor.getWalls()
-        map_width = walls.width
-        map_height = walls.height
-        max_map_len = max(map_width, map_height)
-        # 计算队友间距离，并归一化
         team = [successor.getAgentState(i) for i in self.getTeam(successor)]
         team_dist = self.getMazeDistance(team[0].getPosition(), team[1].getPosition())
-        if max_map_len > 0:
-            features['teamDistance'] = float(team_dist) / max_map_len  # 归一化: 距离/地图最大边长
-        else:
-            features['teamDistance'] = 0
+        features['teamDistance'] = team_dist
 
         # Computes distance to invaders we can see
         enemies = [successor.getAgentState(i) for i in self.getOpponents(successor)]
         invaders = [a for a in enemies if a.isPacman and a.getPosition() != None]
         features['numInvaders'] = len(invaders)
-        if len(invaders) > 0 and max_map_len > 0:
+        if len(invaders) > 0:
             dists = [self.getMazeDistance(myPos, a.getPosition()) for a in invaders]
-            features['invaderDistance'] = float(min(dists)) / max_map_len  # 归一化: 距离/地图最大边长
-        else:
-            features['invaderDistance'] = 0  # 没有入侵者则设为0
+            features['invaderDistance'] = min(dists)
 
         if action == Directions.STOP: features['stop'] = 1
         rev = Directions.REVERSE[gameState.getAgentState(self.index).configuration.direction]
         if action == rev: features['reverse'] = 1
 
-        # 如果我方agent是scared状态，需要远离invaders
-        if myState.scaredTimer > 0:
-            features["isScared"] = 1
-            # 赋一个归一化后的极大值（此时scared要远离入侵者，给1.0效果等同于极远）
-            features["invaderDistance"] = 1.0
-        else:
-            features["isScared"] = 0
-            features["invaderDistance"] = 0
         return features
 
     def getDefensiveWeights(self):
