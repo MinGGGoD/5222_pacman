@@ -748,29 +748,31 @@ class MixedAgent(CaptureAgent):
         features["chance-return-food"] = (currAgentState.numCarrying)*(1 - dist_home/(walls.width+walls.height))# The closer to home, the larger food carried, more chance return food
                  
         teamIndices = self.getTeam(gameState)
-        if self.index == teamIndices[1]:
-            # 把最靠上边的食物作为目标
-            food_list = self.getFood(gameState).asList()
-            if len(food_list) > 0:
-                top_food = max(food_list, key=lambda x: x[1])
-                dist = self.getMazeDistance((next_x, next_y), top_food)
-                if dist is not None:
-                    # make the distance a number less than one otherwise the update
-                    # will diverge wildly
-                    features["closest-food"] = dist/(walls.width+walls.height)
-                else:
-                    features["closest-food"] = 0
+        upperAgent = teamIndices[1] if self.red else teamIndices[0]
+        midY = walls.height // 2
+        food_list = self.getFood(gameState).asList()
+
+        if self.index == upperAgent:
+            # 上半区目标：只考虑上半边的食物
+            upper_food = [p for p in food_list if int(p[1]) >= midY]
+            if upper_food:
+                dist = min(self.getMazeDistance((next_x, next_y), p) for p in upper_food)
             else:
-                features["closest-food"] = 0
+                # 上半区没有食物时，退化为全局最近食物
+                dist = self.closestFood((next_x, next_y), food, walls)
         else:
-            # agent 2 目标食物为 Closest food
-            dist = self.closestFood((next_x, next_y), food, walls)
-            if dist is not None:
-                # make the distance a number less than one otherwise the update
-                # will diverge wildly
-                features["closest-food"] = dist/(walls.width+walls.height)
+            # 下半区目标：只考虑下半边的食物
+            lower_food = [p for p in food_list if int(p[1]) < midY]
+            if lower_food:
+                dist = min(self.getMazeDistance((next_x, next_y), p) for p in lower_food)
             else:
-                features["closest-food"] = 0
+                # 下半区没有食物时，退化为全局最近食物
+                dist = self.closestFood((next_x, next_y), food, walls)
+
+        if dist is not None:
+            features["closest-food"] = dist/(walls.width+walls.height)
+        else:
+            features["closest-food"] = 0
                 
         # 新增撞上鬼的的feature, 如果撞上鬼，则惩罚
         if "crash-ghost" not in features:
