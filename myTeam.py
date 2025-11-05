@@ -80,15 +80,39 @@ class MixedAgent(CaptureAgent):
     # You should add your weights for new low level planner here as well.
     # weights are defined as class attribute here, so taht agents share same weights.
     QLWeights = {
-            "offensiveWeights":{'closest-food': -1, 
-                                        'bias': 1, 
-                                        '#-of-ghosts-1-step-away': -100, 
-                                        'successorScore': 100, 
-                                        'chance-return-food': 10,
-                                        },
-            "defensiveWeights": {'numInvaders': -1000, 'onDefense': 100,'teamDistance':2 ,'invaderDistance': -10, 'stop': -100, 'reverse': -2},
-            "escapeWeights": {'onDefense': 1000, 'enemyDistance': 30, 'stop': -100, 'distanceToHome': -20}
+        'offensiveWeights': {
+            'bias': 1.0,                      # 必须是 0 或小的正数，以鼓励行动。绝不能是 -478。
+            'successorScore': 100.0,          # 得分是主要目标
+            'chance-return-food': 50.0,       # 运送食物是好事
+            
+            # --- 成本/惩罚 (负数) ---
+            'closest-food': -10.0,            # 距离是成本
+            '#-of-ghosts-1-step-away': -200.0, # 幽灵在旁边非常糟糕
+            'crash-ghost': -1,           # 撞鬼是极度糟糕的 (特征值为 1.0)
+            'stop': -1.0,                   # 停止是糟糕的
+            'reverse': -1.0                  # 回头是低效的
+        }, 
+        'defensiveWeights': {
+            'onDefense': 100.0,               # 待在防守区域是好的
+            'teamDistance': 2.0,              # 与队友保持距离（散开）
+            
+            # --- 成本/惩罚 (负数) ---
+            'numInvaders': -1000.0,           # 入侵者是极度糟糕的
+            'invaderDistance': -10.0,         # “距离”是成本，权重为负（鼓励靠近）
+            'distanceToBorder': -5.0,         # “距离”是成本，权重为负（鼓励靠近）
+            'stop': -1.0, 
+            'reverse': -1.0
+        }, 
+        'escapeWeights': {
+            'onDefense': 1000.0,              # 回到己方领地是首要目标
+            'enemyDistance': 30.0,            # [关键修复] “距离”是正权重（鼓励最大化距离）
+            
+            # --- 成本/惩罚 (负数) ---
+            'distanceToHome': -100.0,         # “距离”是成本，权重为负（鼓励最小化距离）
+            'crash-ghost': -1.0,           
+            'stop': -1.0
         }
+    }
     QLWeightsFile = BASE_FOLDER+'/QLWeightsMyTeam.txt'
 
     # Also can use class variable to exchange information between agents.
@@ -116,6 +140,28 @@ class MixedAgent(CaptureAgent):
         
         # Use a dictionary to save information about current agent.
         MixedAgent.CURRENT_ACTION[self.index]={}
+        
+        # --- 新增：缓存边境线坐标 ---
+        self.borderCoordinates = []
+        walls = gameState.getWalls()
+        width = walls.width
+        height = walls.height
+        
+        # 确定我方领土一侧的边境线 x 坐标
+        border_x = 0
+        if self.red:
+            # 红队 (左侧), 边境在 (width // 2) - 1
+            border_x = (width // 2) - 1
+        else:
+            # 蓝队 (右侧), 边境在 width // 2
+            border_x = width // 2
+            
+        # 遍历该 x 坐标上的所有 y 点
+        for y in range(height):
+            # 如果这个点不是墙 [cite: 261, 482]，它就是一个可通行的边境点
+            if not walls[border_x][y]:
+                self.borderCoordinates.append((border_x, y))
+        
         """
         Open weights file if it exists, otherwise start with empty weights.
         NEEDS TO BE CHANGED BEFORE SUBMISSION
@@ -172,7 +218,7 @@ class MixedAgent(CaptureAgent):
         # Get next action from the plan
         highLevelAction = self.highLevelPlan[self.currentActionIndex][0].name
         MixedAgent.CURRENT_ACTION[self.index] = highLevelAction
-        print("Agent:", self.index, highLevelAction)
+        print(f"Agent {self.index} 执行 高层plan: {highLevelAction}")
 
         #-------------Low Level Plan Section-------------------
         # Get the low level plan using Q learning, and return a low level action at last.
@@ -349,9 +395,26 @@ class MixedAgent(CaptureAgent):
     def getGoals(self, objects: List[Tuple], initState: List[Tuple]):
         # Check a list of goal functions from high priority to low priority if the goal is applicable
         # Return the pddl goal states for selected goal function
-        if (("winning_gt5",) in initState):
+        # 本人背包≥3, go home
+        myObj = "a{}".format(self.index) # 获取当前智能体的 PDDL 对象名称
+        myCarrierGoal = False # 是否携带了足够的食物
+        # 检查 *我* 是否携带了足够的食物
+        for fact in initState:
+            if len(fact) == 2 and fact[0] == "3_food_in_backpack" and fact[1] == myObj:
+                myCarrierGoal = True
+                break  # 找到自己的状态就够了
+
+        
+        if myCarrierGoal:
+            print(f'Agent {self.index}: 携带 >= 3 食物, 回家')
+            positiveGoal = []
+            negtiveGoal = [("is_pacman", myObj)] # 只为自己设置 "go_home" 目标
+            return positiveGoal, negtiveGoal
+        elif (("winning_gt10",) in initState):
+            print(f'Agent {self.index}: winning_gt10, 去 Patrol')
             return self.goalDefWinning(objects, initState)
         else:
+            print(f'Agent {self.index}: 没有 winning_gt10, 去 attack')
             return self.goalScoring(objects, initState)
 
     def goalScoring(self,objects: List[Tuple], initState: List[Tuple]):
@@ -445,7 +508,7 @@ class MixedAgent(CaptureAgent):
             rewardFunction = self.getDefensiveReward
             featureFunction = self.getDefensiveFeatures
             weights = self.getDefensiveWeights()
-            learningRate = 0 # learning rate set to 0 as reward function not implemented for this action, do not do q update 
+            learningRate = self.alpha # learning rate set to 0 as reward function not implemented for this action, do not do q update 
 
         if len(legalActions) != 0:
             prob = util.flipCoin(self.epsilon) # get change of perform random movement
@@ -478,9 +541,13 @@ class MixedAgent(CaptureAgent):
     def updateWeights(self, gameState, action, rewardFunction, featureFunction, weights, learningRate):
         features = featureFunction(gameState, action)
         nextState = self.getSuccessor(gameState, action)
-
+        
         reward = rewardFunction(gameState, nextState)
         for feature in features:
+            # 先临时处理下 TODO
+            if feature not in weights:
+                print('feature not in weights:', feature)
+                weights[feature] = 0.0
             correction = (reward + self.discountRate*self.getValue(nextState, featureFunction, weights)) - self.getQValue(features, weights)
             weights[feature] =weights[feature] + learningRate*correction * features[feature]
         
@@ -515,22 +582,80 @@ class MixedAgent(CaptureAgent):
 
         if ghost_1_step > 0:
             base_reward -= 100 # 5 -> 100
-        if score <0:
+        if score < 0:
             base_reward += score
         if new_food_returned > 0:
             # return home with food get reward score
-            base_reward += new_food_returned*10
+            base_reward += new_food_returned*30
+            
+        if nextAgentState.numCarrying > currentAgentState.numCarrying:
+            base_reward += 30 # 带的食物多了给奖励, 鼓励吃食物
         
         # 装鬼惩罚
         if nextAgentState.getPosition() in ghosts:
-            base_reward -= 100
+            base_reward -= 200
+            
+        # 检查 *下一个* 状态的方向是否为 STOP
+        if nextAgentState.configuration.direction == Directions.STOP:
+            base_reward -= 100  # 停止不动惩罚
+        if nextAgentState.configuration.direction == Directions.REVERSE:
+            base_reward -= 30 # 来回摆动惩罚
         
         print("Agent ", self.index," reward ",base_reward)
         return base_reward
     
-    def getDefensiveReward(self,gameState, nextState):
-        print("Warnning: DefensiveReward not implemented yet, and learnning rate is 0 for defensive ",file=sys.stderr)
-        return 0
+    def getDefensiveReward(self, gameState: GameState, nextState: GameState):
+        """
+        为 'defensive' (patrol) 动作计算奖励。
+        目标: 拦截并吃掉入侵者。
+        """
+        
+        # --- 1. 获取当前和下一步的状态信息 ---
+        myCurrentState = gameState.getAgentState(self.index)
+        myNextState = nextState.getAgentState(self.index)
+        myCurrentPos = myCurrentState.getPosition()
+        myNextPos = myNextState.getPosition()
+        enemies = [gameState.getAgentState(i) for i in self.getOpponents(gameState)]
+        invandersAround = [a for a in enemies if a.isPacman and a.getPosition() is not None]
+        invandersAroundPos = [a.getPosition() for a in invandersAround]
+        # 设置一个基础的“行动成本”，鼓励智能体更快地完成任务
+        base_reward =  -50
+
+        # --- 基础逻辑 ---
+        if len(invandersAround) > 0: # 有入侵者
+            # 每一步都在接近入侵者, 奖励
+            for invader in invandersAround:
+                current_dist_to_invader = self.getMazeDistance(myCurrentPos, invader.getPosition())
+                next_dist_to_invader = self.getMazeDistance(myNextPos, invader.getPosition())
+                if next_dist_to_invader < current_dist_to_invader:
+                    base_reward += 10
+                else:
+                    base_reward -= 5 # 远离入侵者惩罚
+               
+            # 吃掉入侵者奖励
+            if myNextPos in invandersAroundPos:
+                base_reward += 200
+            
+            # # 自己是scared状态, 被吃掉惩罚
+            # if myCurrentState.scaredTimer > 0 and myNextPos == self.startPosition:
+            #     base_reward -= 200
+        # else: 
+        #     # 没有入侵者，巡逻，尽量往边境线靠
+        #     currentDistToBorder = self.getDistanceToBorder(myCurrentPos)
+        #     nextDistToBorder = self.getDistanceToBorder(myNextPos)
+        #     if nextDistToBorder < currentDistToBorder:
+        #         base_reward += 5  # 离边境线更近了，很好
+        #     elif nextDistToBorder > currentDistToBorder:
+        #         base_reward -= 5  # 正在远离边境线，不好
+                
+        # 通用惩罚
+        if myNextState.configuration.direction == Directions.STOP:
+            base_reward -= 100  # 停止不动惩罚
+        if myNextState.configuration.direction == Directions.REVERSE:
+            base_reward -= 30 # 来回摆动惩罚
+
+        # print(f"Agent {self.index} (Defensive) reward: {reward}") # 训练时可以取消注释来调试
+        return base_reward
     
     def getEscapeReward(self,gameState, nextState):
         currentAgentState:AgentState = gameState.getAgentState(self.index)
@@ -539,21 +664,35 @@ class MixedAgent(CaptureAgent):
         ghosts = self.getGhostLocs(gameState)
         ghost_1_step = sum(nextAgentState.getPosition() in Actions.getLegalNeighbors(g,gameState.getWalls()) for g in ghosts)
 
-        base_reward =  -50 + nextAgentState.numReturned + nextAgentState.numCarrying
+        base_reward =  -50 
+        # + nextAgentState.numReturned + nextAgentState.numCarrying
         new_food_returned = nextAgentState.numReturned - currentAgentState.numReturned
-        next_num_carrying = nextAgentState.numCarrying 
 
-        if ghost_1_step > 0:
-            base_reward -= 100 # 5 -> 100
-        if next_num_carrying > currentAgentState.numCarrying:
-            base_reward += 10
-        if new_food_returned > 0:
-            # return home with food get reward score
-            base_reward += new_food_returned*10
+        if ghost_1_step > 0: # 逃跑时必须远离鬼，给稍大惩罚
+            base_reward -= 10
         
-        # 装鬼惩罚
+        if new_food_returned > 0: 
+            # 逃跑时身上肯定带了食物，重中之重是把食物送回家的粉，所以回家带食物给大额奖励
+            base_reward += new_food_returned * 50
+            
+        # 获取距离中线的距离
+        current_dist_to_border = min(self.getMazeDistance(currentAgentState.getPosition(), border) for border in self.borderCoordinates)
+        next_dist_to_border = min(self.getMazeDistance(nextAgentState.getPosition(), border) for border in self.borderCoordinates)
+        if next_dist_to_border < current_dist_to_border:
+            base_reward += 20
+        else:
+            base_reward -= 5
+        
+        # 逃跑的时候撞鬼惩大惩罚
         if nextAgentState.getPosition() in ghosts:
-            base_reward -= 100
+            base_reward -= 200
+            
+        # 检查 *下一个* 状态的方向是否为 STOP
+        if nextAgentState.configuration.direction == Directions.STOP:
+            base_reward -= 100  # 停止不动惩罚
+        if nextAgentState.configuration.direction == Directions.REVERSE:
+            base_reward -= 30 # 来回摆动惩罚
+
         
         print("Agent ", self.index," reward ",base_reward)
         return base_reward
@@ -576,7 +715,7 @@ class MixedAgent(CaptureAgent):
         nextState = self.getSuccessor(gameState, action)
 
         # Successor Score
-        features['successorScore'] = self.getScore(nextState)/(walls.width+walls.height) * 10
+        features['successorScore'] = self.getScore(nextState)/(walls.width+walls.height)
 
         # Bias
         features["bias"] = 1.0
@@ -588,9 +727,19 @@ class MixedAgent(CaptureAgent):
         features["#-of-ghosts-1-step-away"] = sum((next_x, next_y) in Actions.getLegalNeighbors(g, walls) for g in ghosts) 
         
         
-        dist_home = self.getMazeDistance((next_x, next_y), gameState.getInitialAgentPosition(self.index))+1
+        # 距离家的距离应该是过了边境线就算家
+        # 检查下一个位置是否已经回到己方领地（即不再是Pacman身份）
+        if not nextState.getAgentState(self.index).isPacman:
+            dist_home = 0
+        else:
+            # 距离最近边境线位置的距离
+            border_positions = self.borderCoordinates if hasattr(self, 'borderCoordinates') else []
+            if border_positions:
+                dist_home = min(self.getMazeDistance((next_x, next_y), border) for border in border_positions)
+            # else:
+            #     dist_home = self.getMazeDistance((next_x, next_y), gameState.getInitialAgentPosition(self.index))+1
 
-        features["chance-return-food"] = (currAgentState.numCarrying)*(1 - dist_home/(walls.width+walls.height)) # The closer to home, the larger food carried, more chance return food
+        features["chance-return-food"] = (currAgentState.numCarrying / 20.0)*(1 - dist_home/(walls.width+walls.height))# The closer to home, the larger food carried, more chance return food
                  
         teamIndices = self.getTeam(gameState)
         if self.index == teamIndices[0]:
@@ -617,12 +766,27 @@ class MixedAgent(CaptureAgent):
             else:
                 features["closest-food"] = 0
                 
-        # 新增撞上鬼的的feature, 如果撞上鬼，则惩罚100
+        # 新增撞上鬼的的feature, 如果撞上鬼，则惩罚
+        if "crash-ghost" not in features:
+            features["crash-ghost"] = 0
         if nextState.getAgentPosition(self.index) in ghosts:
-            features["crash-ghost"] = 1
+            features["crash-ghost"] = 1.0
         else:
             features["crash-ghost"] = 0
+        
+        # stop的feature, 如果stop，则惩罚
+        if action == Directions.STOP: 
+            features['stop'] = 1
+        else: 
+            features['stop'] = 0
+
+        rev = Directions.REVERSE[gameState.getAgentState(self.index).configuration.direction]
+        if action == rev: 
+            features['reverse'] = 1
+        else:
+            features['reverse'] = 0
         return features
+    
 
     def getOffensiveWeights(self):
         return MixedAgent.QLWeights["offensiveWeights"]
@@ -645,7 +809,10 @@ class MixedAgent(CaptureAgent):
         enemiesAround = [a for a in enemies if not a.isPacman and a.getPosition() != None]
         if len(enemiesAround) > 0:
             dists = [self.getMazeDistance(myPos, a.getPosition()) for a in enemiesAround]
-            features['enemyDistance'] = min(dists)
+            # features['enemyDistance'] = min(dists)
+            # norm
+            walls = gameState.getWalls()
+            features['enemyDistance'] = min(dists)/(walls.width + walls.height)
 
         if action == Directions.STOP: features['stop'] = 1
         
@@ -670,12 +837,14 @@ class MixedAgent(CaptureAgent):
                     dist = self.getMazeDistance(myPos, home)
                     if dist < minHomeDist:
                         minHomeDist = dist
-        features["distanceToHome"] = minHomeDist if minHomeDist != float('inf') else 0
+        features["distanceToHome"] = (minHomeDist /(walls.width + walls.height)) if minHomeDist != float('inf') else 0
 
         # 撞鬼惩罚
+        if "crash-ghost" not in features:
+            features["crash-ghost"] = 0.0
         ghosts = self.getGhostLocs(gameState)
         if myPos in ghosts:
-            features["crash-ghost"] = 1
+            features["crash-ghost"] = 1.0
         else:
             features["crash-ghost"] = 0
         return features
@@ -691,6 +860,7 @@ class MixedAgent(CaptureAgent):
 
         myState = successor.getAgentState(self.index)
         myPos = myState.getPosition()
+        walls = gameState.getWalls()
 
         # Computes whether we're on defense (1) or offense (0)
         features['onDefense'] = 1
@@ -698,20 +868,60 @@ class MixedAgent(CaptureAgent):
 
         team = [successor.getAgentState(i) for i in self.getTeam(successor)]
         team_dist = self.getMazeDistance(team[0].getPosition(), team[1].getPosition())
-        features['teamDistance'] = team_dist
+        features['teamDistance'] = team_dist / (walls.width + walls.height)
 
-        # Computes distance to invaders we can see
+        # --- 防守逻辑 ---
+        
+        # 1. 获取所有敌人的状态
         enemies = [successor.getAgentState(i) for i in self.getOpponents(successor)]
-        invaders = [a for a in enemies if a.isPacman and a.getPosition() != None]
-        features['numInvaders'] = len(invaders)
-        if len(invaders) > 0:
-            dists = [self.getMazeDistance(myPos, a.getPosition()) for a in invaders]
-            features['invaderDistance'] = min(dists)
+        
+        # 2. 识别所有入侵者（无论可见与否）
+        all_invaders = [a for a in enemies if a.isPacman]
+        
+        # 3. 识别可见的入侵者
+        visible_invaders = [a for a in all_invaders if a.getPosition() != None]
+        
+        # 4. 识别不可见的入侵者 (获取他们的索引)
+        # Fix: cannot use a.index (AgentState has no attribute 'index'), so map state back to index
+        opponent_indices = self.getOpponents(successor)
+        unseen_invader_indices = [opponent_indices[i] for i, a in enumerate(enemies) if a.getPosition() is None]
+        
+        # 5. 获取所有敌人的嘈杂距离
+        noisy_distances = successor.getAgentDistances()
+
+        features['numInvaders'] = len(all_invaders) / 2.0 # 归一化: 总入侵者数量
+        
+        min_dist_to_invader = float('inf')
+
+        if len(visible_invaders) > 0:
+            # [情况A] 至少有一个可见的入侵者：使用精确距离
+            dists = [self.getMazeDistance(myPos, a.getPosition()) for a in visible_invaders]
+            min_dist_to_invader = min(dists)
+            
+        elif len(unseen_invader_indices) > 0:
+            # [情况B] 敌人不可见，但我们知道它在：使用嘈杂距离
+            # 注意：这只是一个估计值，但总比没有好
+            dists = [noisy_distances[i] for i in unseen_invader_indices]
+            min_dist_to_invader = min(dists)
+        
+        
+        if min_dist_to_invader != float('inf'):
+            # [激活“追击”模式]
+            # 只要我们知道有入侵者（无论是否可见），就激活 invaderDistance
+            features['invaderDistance'] = min_dist_to_invader / (walls.width + walls.height)
+            features['distanceToBorder'] = 0.0 # 关闭“巡逻边境”
+        else:
+            # [激活“巡逻”模式]
+            # 确认没有入侵者，才去巡逻边境
+            features['invaderDistance'] = 0.0
+            distToBorder = self.getDistanceToBorder(myPos)
+            features['distanceToBorder'] = distToBorder / (walls.width + walls.height)
+
+        
 
         if action == Directions.STOP: features['stop'] = 1
         rev = Directions.REVERSE[gameState.getAgentState(self.index).configuration.direction]
         if action == rev: features['reverse'] = 1
-
         return features
 
     def getDefensiveWeights(self):
@@ -779,5 +989,20 @@ class MixedAgent(CaptureAgent):
                         if opPos and not opIsPacman: 
                                 ghosts.append(opPos)
         return ghosts
+    
+    def getDistanceToBorder(self, pos):
+        """
+        Calculate the maze distance from the given position 'pos' 
+        to the closest point in 'self.borderCoordinates'
+        """
+        if not self.borderCoordinates:
+            return 0 
+            
+        minDist = float('inf')
+        for borderPos in self.borderCoordinates:
+            dist = self.getMazeDistance(pos, borderPos)
+            if dist < minDist:
+                minDist = dist
+        return minDist
     
 

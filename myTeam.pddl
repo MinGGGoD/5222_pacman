@@ -64,7 +64,11 @@
 
     (:action attack
         :parameters (?a - current_agent ?e1 - enemy1 ?e2 - enemy2 )
-        :precondition (and (not (is_pacman ?e1)) (not (is_pacman ?e2)) (food_available)  )
+        :precondition (and 
+            (not (is_pacman ?e1)) 
+            (not (is_pacman ?e2)) 
+            (food_available)
+        )
         :effect (and 
             (not (food_available))
         )
@@ -83,7 +87,7 @@
 
 
     (:action go_home
-        :parameters (?a - current_agent)
+        :parameters (?a - team)
         :precondition (and (is_pacman ?a) )
         :effect (and 
             (not (is_pacman ?a))
@@ -96,7 +100,7 @@
             (not (is_pacman ?a))
             (not (is_pacman ?e1))
             (not (is_pacman ?e2))
-            (winning_gt5)
+            (winning_gt10)
         )
         :effect (and 
             (defend_foods)
