@@ -490,7 +490,7 @@ class MixedAgent(CaptureAgent):
             self.last_pos = myPos
         
         # 如果在边界附近停留太久
-        if myPos == self.last_pos:
+        if abs(myPos[0] - self.last_pos[0]) + abs(myPos[1] - self.last_pos[1]) <= 1:
             self.border_hesitation_counter += 1
         else:
             self.border_hesitation_counter = 0
@@ -517,9 +517,32 @@ class MixedAgent(CaptureAgent):
                 width = walls.width
                 border_x = (width // 2) if self.red else (width // 2 - 1)
                 
-                # ✅ 方法1: 如果在边界徘徊超过3步，强制跨线
+                # 如果在边界徘徊超过3步，强制跨线
                 if self.border_hesitation_counter > 3 or abs(myPos[0] - border_x) <= 1:
                     print(f"Agent {self.index}: 强制跨越边界！")
+                    
+                    # # 方案：评估所有非 STOP 动作，使得到边界的迷宫距离最小（可自动识别死胡同需先后退）
+                    # candidate_actions = [a for a in legalActions if a != Directions.STOP]
+                    # if candidate_actions:
+                    #     best_actions = []
+                    #     best_dist = float('inf')
+                    #     for cand in candidate_actions:
+                    #         np = Actions.getSuccessor(myPos, cand)
+                    #         d = self.getDistanceToBorder(np)
+                    #         if d < best_dist:
+                    #             best_dist = d
+                    #             best_actions = [cand]
+                    #         elif d == best_dist:
+                    #             best_actions.append(cand)
+
+                    #     # 在同等“最优”中，尽量优先选择朝边界方向的一步
+                    #     prefer = []
+                    #     for a in best_actions:
+                    #         np = Actions.getSuccessor(myPos, a)
+                    #         if (self.red and np[0] > myPos[0]) or ((not self.red) and np[0] < myPos[0]):
+                    #             prefer.append(a)
+
+                    #     action = random.choice(prefer if prefer else best_actions)
                     
                     # 过滤出能跨越边界的动作
                     cross_border_actions = []
@@ -571,6 +594,40 @@ class MixedAgent(CaptureAgent):
                         values.append((self.getQValue(featureFunction(gameState, action), weights), action))
                 action = max(values)[1]
         myPos = gameState.getAgentPosition(self.index)
+
+        # --- 通用卡住兜底：若近期位置重复/摆动，则用 BFS 规划一步避墙而行 ---
+        if not hasattr(self, 'recent_positions'):
+            self.recent_positions = []
+        self.recent_positions.append((int(myPos[0]), int(myPos[1])))
+        if len(self.recent_positions) > 6:
+            self.recent_positions.pop(0)
+        stuck = False
+        if len(self.recent_positions) >= 4:
+            last4 = self.recent_positions[-4:]
+            if len(set(last4)) <= 2:
+                stuck = True
+
+        if stuck:
+            bfs_choice = None
+            if gameState.getAgentState(self.index).isPacman:
+                # 进攻时：规划到目标半区的食物，否则全局食物
+                walls = gameState.getWalls()
+                midY = walls.height // 2
+                food_list = self.getFood(gameState).asList()
+                teamIndices = self.getTeam(gameState)
+                upperAgent = teamIndices[1] if self.red else teamIndices[0]
+                if self.index == upperAgent:
+                    targets = [p for p in food_list if int(p[1]) >= midY] or food_list
+                else:
+                    targets = [p for p in food_list if int(p[1]) < midY] or food_list
+                bfs_choice = self.bfsNextStepToAny(gameState, targets)
+            else:
+                # 跨边界/回家时：规划到最近边界点
+                bfs_choice = self.bfsNextStepToAny(gameState, getattr(self, 'borderCoordinates', []))
+            if bfs_choice:
+                action, nextPos = bfs_choice
+                return [(action, nextPos)]
+
         nextPos = Actions.getSuccessor(myPos,action)
         return [(action, nextPos)]
 
@@ -1015,6 +1072,55 @@ class MixedAgent(CaptureAgent):
                 fringe.append((nbr_x, nbr_y, dist+1))
         # no food found
         return None
+
+    def bfsNextStepToAny(self, gameState: GameState, goals):
+        """
+        计算从当前位置到任一目标点的最短路径的第一步动作；若无路径或目标为空返回 None。
+        """
+        if not goals:
+            return None
+        walls = gameState.getWalls()
+        start = gameState.getAgentPosition(self.index)
+        if not start:
+            return None
+        sx, sy = int(start[0]), int(start[1])
+        start_int = (sx, sy)
+        goals_set = set((int(x), int(y)) for x, y in goals)
+
+        # 若已在目标上，不需动作
+        if start_int in goals_set:
+            return None
+
+        from collections import deque
+        fringe = deque([start_int])
+        parent = {start_int: None}
+        found = None
+        while fringe:
+            cx, cy = fringe.popleft()
+            if (cx, cy) in goals_set:
+                found = (cx, cy)
+                break
+            for nx, ny in Actions.getLegalNeighbors((cx, cy), walls):
+                npos = (int(nx), int(ny))
+                if npos not in parent:
+                    parent[npos] = (cx, cy)
+                    fringe.append(npos)
+
+        if not found:
+            return None
+
+        # 回溯第一步
+        cur = found
+        prev = parent[cur]
+        while prev and parent[prev] is not None:
+            cur = prev
+            prev = parent[cur]
+
+        # cur 现在是从 start 出发的第一步位置
+        dx, dy = cur[0] - sx, cur[1] - sy
+        direction = Actions.vectorToDirection((dx, dy))
+        nextPos = Actions.getSuccessor(start, direction)
+        return (direction, nextPos)
     
     def stateClosestFood(self, gameState:GameState):
         pos = gameState.getAgentPosition(self.index)
