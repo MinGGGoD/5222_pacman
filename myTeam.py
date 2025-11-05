@@ -482,6 +482,19 @@ class MixedAgent(CaptureAgent):
         featureFunction = None
         weights = None
         learningRate = 0
+        myState = gameState.getAgentState(self.index)
+        myPos = myState.getPosition()
+        # 检测边界徘徊问题
+        if not hasattr(self, 'border_hesitation_counter'):
+            self.border_hesitation_counter = 0
+            self.last_pos = myPos
+        
+        # 如果在边界附近停留太久
+        if myPos == self.last_pos:
+            self.border_hesitation_counter += 1
+        else:
+            self.border_hesitation_counter = 0
+        self.last_pos = myPos
 
         ##########
         # The following classification of high level actions is only a example.
@@ -491,10 +504,41 @@ class MixedAgent(CaptureAgent):
             # The q learning process for offensive actions are complete, 
             # you can improve getOffensiveFeatures to collect more useful feature to pass more information to Q learning model
             # you can improve the getOffensiveReward function to give reward for new features and improve the trainning process .
-            rewardFunction = self.getOffensiveReward
-            featureFunction = self.getOffensiveFeatures
-            weights = self.getOffensiveWeights()
-            learningRate = self.alpha
+            # 如果已经是Pacman，继续正常执行
+            
+            if myState.isPacman:
+                rewardFunction = self.getOffensiveReward
+                featureFunction = self.getOffensiveFeatures
+                weights = self.getOffensiveWeights()
+                learningRate = self.alpha
+            else:
+                # 如果是Ghost状态，强制向敌方领地移动
+                walls = gameState.getWalls()
+                width = walls.width
+                border_x = (width // 2) if self.red else (width // 2 - 1)
+                
+                # ✅ 方法1: 如果在边界徘徊超过3步，强制跨线
+                if self.border_hesitation_counter > 3 or abs(myPos[0] - border_x) <= 1:
+                    print(f"Agent {self.index}: 强制跨越边界！")
+                    
+                    # 过滤出能跨越边界的动作
+                    cross_border_actions = []
+                    for action in legalActions:
+                        nextPos = Actions.getSuccessor(myPos, action)
+                        # 红队要向右（x增大），蓝队要向左（x减小）
+                        if self.red and nextPos[0] > myPos[0]:
+                            cross_border_actions.append(action)
+                        elif not self.red and nextPos[0] < myPos[0]:
+                            cross_border_actions.append(action)
+                    
+                    if cross_border_actions:
+                        action = random.choice(cross_border_actions)
+                        nextPos = Actions.getSuccessor(myPos, action)
+                        return [(action, nextPos)]
+                rewardFunction = self.getOffensiveReward
+                featureFunction = self.getOffensiveFeatures
+                weights = self.getOffensiveWeights()
+                learningRate = self.alpha
         elif highLevelAction == "go_home":
             # 逃回家时暂时禁用 stop TODO
             non_stop = [a for a in legalActions if a != Directions.STOP]
