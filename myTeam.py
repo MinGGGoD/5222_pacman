@@ -24,6 +24,7 @@ from ast import Raise
 from typing import List, Tuple
 
 from numpy import true_divide
+from numpy.ma import negative
 from captureAgents import CaptureAgent
 import distanceCalculator
 import random, time, util, sys, os
@@ -31,6 +32,7 @@ from capture import GameState, noisyDistance
 from game import Directions, Actions, AgentState, Agent
 from util import nearestPoint
 import sys,os
+import heapq
 
 # the folder of current file.
 BASE_FOLDER = os.path.dirname(os.path.abspath(__file__))
@@ -90,7 +92,7 @@ class MixedAgent(CaptureAgent):
             '#-of-ghosts-1-step-away': -200.0, # 幽灵在旁边非常糟糕
             'crash-ghost': -1,           # 撞鬼是极度糟糕的 (特征值为 1.0)
             'stop': -1.0,                   # 停止是糟糕的
-            'reverse': -1.0                  # 回头是低效的
+            'reverse': -1.0,                  # 回头是低效的
         }, 
         'defensiveWeights': {
             'onDefense': 100.0,               # 待在防守区域是好的
@@ -113,7 +115,7 @@ class MixedAgent(CaptureAgent):
             'stop': -1.0
         }
     }
-    QLWeightsFile = BASE_FOLDER+'/QLWeightsMyTeam.txt'
+    QLWeightsFile = BASE_FOLDER+'/QLWeightsMyTeam_zym.txt'
 
     # Also can use class variable to exchange information between agents.
     CURRENT_ACTION = {}
@@ -170,7 +172,7 @@ class MixedAgent(CaptureAgent):
         if os.path.exists(MixedAgent.QLWeightsFile):
             with open(MixedAgent.QLWeightsFile, "r") as file:
                 MixedAgent.QLWeights = eval(file.read())
-            print("Load QLWeights:",MixedAgent.QLWeights )
+            # print("Load QLWeights:",MixedAgent.QLWeights )
         
     
     def final(self, gameState : GameState):
@@ -179,7 +181,7 @@ class MixedAgent(CaptureAgent):
         You may want to comment (disallow) this function when submit to contest server.
         """
         if self.trainning:
-            print("Write QLWeights:", MixedAgent.QLWeights)
+            # print("Write QLWeights:", MixedAgent.QLWeights)
             file = open(MixedAgent.QLWeightsFile, 'w')
             file.write(str(MixedAgent.QLWeights))
             file.close()
@@ -199,7 +201,7 @@ class MixedAgent(CaptureAgent):
 
         # Collect objects and init states from gameState
         objects, initState = self.get_pddl_state(gameState)
-        positiveGoal, negtiveGoal = self.getGoals(objects,initState)
+        positiveGoal, negtiveGoal = self.getGoals(objects,initState, gameState)
 
         # Check if we can stick to current plan 
         if not self.stateSatisfyCurrentPlan(initState, positiveGoal, negtiveGoal):
@@ -218,14 +220,14 @@ class MixedAgent(CaptureAgent):
         # Get next action from the plan
         highLevelAction = self.highLevelPlan[self.currentActionIndex][0].name
         MixedAgent.CURRENT_ACTION[self.index] = highLevelAction
-        print(f"Agent {self.index} 执行 高层plan: {highLevelAction}")
 
         #-------------Low Level Plan Section-------------------
         # Get the low level plan using Q learning, and return a low level action at last.
         # A low level action is defined in Directions, whihc include {"North", "South", "East", "West", "Stop"}
 
         if not self.posSatisfyLowLevelPlan(gameState):
-            self.lowLevelPlan = self.getLowLevelPlanQL(gameState, highLevelAction) #Generate low level plan with q learning
+            # self.lowLevelPlan = self.getLowLevelPlanQL(gameState, highLevelAction) #Generate low level plan with q learning
+            self.lowLevelPlan = self.getLowLevelPlanHS(gameState, highLevelAction) #Generate low level plan with q learning
             # you can replace the getLowLevelPlanQL with getLowLevelPlanHS and implement heuristic search planner
             self.lowLevelActionIndex = 0
         lowLevelAction = self.lowLevelPlan[self.lowLevelActionIndex][0]
@@ -392,37 +394,138 @@ class MixedAgent(CaptureAgent):
         # Current action precondition not satisfied anymore, need new plan
         return False
     
-    def getGoals(self, objects: List[Tuple], initState: List[Tuple]):
+    def getGoals(self, objects: List[Tuple], initState: List[Tuple], gameState: GameState):
         # Check a list of goal functions from high priority to low priority if the goal is applicable
         # Return the pddl goal states for selected goal function
-        # 本人背包≥3, go home
-        myObj = "a{}".format(self.index) # 获取当前智能体的 PDDL 对象名称
-        myCarrierGoal = False # 是否携带了足够的食物
-        # 检查 *我* 是否携带了足够的食物
+        myObj = "a{}".format(self.index)
+        myCarrierGoal = False
+        # 当前agent
+        cur_agent_state = gameState.getAgentState(self.index)
+        carrying_count = cur_agent_state.numCarrying
+        
+        # 检查是否携带了足够的食物
         for fact in initState:
             if len(fact) == 2 and fact[0] == "3_food_in_backpack" and fact[1] == myObj:
                 myCarrierGoal = True
-                break  # 找到自己的状态就够了
-
+                break
         
+        # ==================== 关键改进：时间感知 ====================
+        timeRemaining = gameState.data.timeleft
+        currentScore = self.getScore(gameState)
+        
+        # 获取当前位置到家的距离（用于判断是否来得及）
+        myPos = gameState.getAgentPosition(self.index)
+        border_positions = self.borderCoordinates if hasattr(self, 'borderCoordinates') else []
+        if border_positions:
+            dist_to_home = min(self.getMazeDistance(myPos, b) for b in border_positions)
+        else:
+            dist_to_home = 10  # 估计值
+        
+        # ==================== 优先级1: 时间紧迫策略 ====================
+        if timeRemaining < 100:
+            # 极度紧迫（<100步）
+            if currentScore > 0:
+                # 领先：立即回家，确保胜利
+                print(f'Agent {self.index}: 时间<100且领先({currentScore}), 立即回家锁定胜利')
+                # 判断当前agent是不是pacman
+                if cur_agent_state.isPacman:
+                    # 回家
+                    positiveGoal = []
+                    negtiveGoal = [("is_pacman", myObj)]
+                    return positiveGoal, negtiveGoal
+                else: # 巡逻
+                    return self.goalDefWinning(objects, initState)
+            elif currentScore < 0:
+                # 落后：必须冒险拿1分
+                if carrying_count > 0:
+                    print(f'Agent {self.index}: 时间<100且落后({currentScore}), 携带{carrying_count}个，立即回家')
+                    positiveGoal = []
+                    negtiveGoal = [("is_pacman", myObj)]
+                    return positiveGoal, negtiveGoal
+                else:
+                    print(f'Agent {self.index}: 时间<100且落后({currentScore}), 冒险抢最后1个食物')
+                    return self.goalScoringAggressive(objects, initState)
+            else:
+                # 平局：抢1分即可
+                if carrying_count > 0:
+                    print(f'Agent {self.index}: 时间<100且平局, 携带{carrying_count}个，立即回家')
+                    positiveGoal = []
+                    negtiveGoal = [("is_pacman", myObj)]
+                    return positiveGoal, negtiveGoal
+                else:
+                    print(f'Agent {self.index}: 时间<100且平局, 抢1个食物')
+                    return self.goalScoringAggressive(objects, initState)
+        
+        elif timeRemaining < 250:
+            # 比较紧迫（100-250步）
+            if currentScore > 0:
+                # 领先：保守，如果携带食物就回家
+                if carrying_count > 0:
+                    print(f'Agent {self.index}: 时间<250且领先({currentScore}), 携带{carrying_count}个回家')
+                    positiveGoal = []
+                    negtiveGoal = [("is_pacman", myObj)]
+                    return positiveGoal, negtiveGoal
+                else:
+                    # 没携带食物，转入防守
+                    print(f'Agent {self.index}: 时间<250且领先({currentScore}), 转入防守')
+                    return self.goalDefWinning(objects, initState)
+            elif currentScore < 0:
+                # 落后：需要积极进攻，但携带2个以上就回家
+                if carrying_count >= 2 or (carrying_count > 0 and dist_to_home > 15):
+                    print(f'Agent {self.index}: 时间<250且落后({currentScore}), 携带{carrying_count}个且距离{dist_to_home}，回家')
+                    positiveGoal = []
+                    negtiveGoal = [("is_pacman", myObj)]
+                    return positiveGoal, negtiveGoal
+                else:
+                    print(f'Agent {self.index}: 时间<250且落后({currentScore}), 继续进攻')
+                    return self.goalScoring(objects, initState)
+            else:
+                # 平局：稍微激进
+                if carrying_count >= 1:
+                    print(f'Agent {self.index}: 时间<250且平局, 携带{carrying_count}个回家')
+                    positiveGoal = []
+                    negtiveGoal = [("is_pacman", myObj)]
+                    return positiveGoal, negtiveGoal
+        
+        # ==================== 优先级2: 携带食物判断（降低阈值）====================
+        # 时间充足时，携带3个回家
+        # 时间紧迫时（已处理），降低阈值
         if myCarrierGoal:
             print(f'Agent {self.index}: 携带 >= 3 食物, 回家')
             positiveGoal = []
-            negtiveGoal = [("is_pacman", myObj)] # 只为自己设置 "go_home" 目标
+            negtiveGoal = [("is_pacman", myObj)]
             return positiveGoal, negtiveGoal
-        elif (("winning_gt10",) in initState):
+        
+        # ==================== 优先级3: 大幅领先时防守 ====================
+        if (("winning_gt10",) in initState):
             print(f'Agent {self.index}: winning_gt10, 去 Patrol')
             return self.goalDefWinning(objects, initState)
+        
+        # ==================== 优先级4: 没有食物时防守 ====================
+        if ('food_available',) not in initState:
+            print(f'Agent {self.index}: 没有 food_available, 所有agents都回家防守')
+            myAgentsIndices = self.getTeam(gameState)
+            positiveGoal = []
+            negtiveGoal = []
+            for i in myAgentsIndices:
+                negtiveGoal += [("is_pacman", "a{}".format(i))]
+            return positiveGoal, negtiveGoal
+        
+        # ==================== 优先级5: 默认进攻 ====================
+        # 检查是否应该更激进（落后时）
+        if currentScore < -3 and timeRemaining > 400:
+            print(f'Agent {self.index}: 落后{abs(currentScore)}分且时间充足, 激进进攻')
+            return self.goalScoringAggressive(objects, initState)
         else:
-            print(f'Agent {self.index}: 没有 winning_gt10, 去 attack')
+            print(f'Agent {self.index}: 正常进攻模式')
             return self.goalScoring(objects, initState)
 
     def goalScoring(self,objects: List[Tuple], initState: List[Tuple]):
         # If we are not winning more than 5 points,
         # we invate enemy land and eat foods, and bring then back.
-
-        positiveGoal = []
-        negtiveGoal = [("food_available",)] # no food avaliable means eat all the food
+        current_agent_obj = "a{}".format(self.index)
+        positiveGoal = [('is_pacman', current_agent_obj), ('3_food_in_backpack', current_agent_obj)]
+        negtiveGoal = [] # no food avaliable means eat all the food
 
         for obj in objects:
             agent_obj = obj[0]
@@ -433,6 +536,18 @@ class MixedAgent(CaptureAgent):
         
         return positiveGoal, negtiveGoal
 
+    def goalScoringAggressive(self, objects: List[Tuple], initState: List[Tuple]):
+        """
+        激进进攻
+        """
+        myObj = "a{}".format(self.index)
+        
+        # 只要求携带食物，不管防守和消灭所有食物
+        positiveGoal = [("is_pacman", myObj), ('3_food_in_backpack', myObj)]
+        negtiveGoal = []
+        
+        return positiveGoal, negtiveGoal
+    
     def goalDefWinning(self,objects: List[Tuple], initState: List[Tuple]):
         # If winning greater than 5 points,
         # this example want defend foods only, and let agents patrol on our ground.
@@ -443,7 +558,8 @@ class MixedAgent(CaptureAgent):
         negtiveGoal = []
         
         return positiveGoal, negtiveGoal
-
+    
+    
     #------------------------------- Heuristic search low level plan Functions -------------------------------
     def getLowLevelPlanHS(self, gameState: GameState, highLevelAction: str) -> List[Tuple[str,Tuple]]:
         # This is a function for plan low level actions using heuristic search.
@@ -451,13 +567,27 @@ class MixedAgent(CaptureAgent):
         # Here, we list some function you might need, read the GameState and CaptureAgent code for more useful functions.
         # These functions also useful for collecting features for Q learnning low levels.
 
-        map = gameState.getWalls() # a 2d array matrix of obstacles, map[x][y] = true means a obstacle(wall) on x,y, map[x][y] = false indicate a free location
+        walls = gameState.getWalls() # a 2d array matrix of obstacles, map[x][y] = true means a obstacle(wall) on x,y, map[x][y] = false indicate a free location
         foods = self.getFood(gameState) # a 2d array matrix of food,  foods[x][y] = true if there's a food.
         capsules = self.getCapsules(gameState) # a list of capsules
         foodNeedDefend = self.getFoodYouAreDefending(gameState) # return food will be eatan by enemy (food next to enemy)
         capsuleNeedDefend = self.getCapsulesYouAreDefending(gameState) # return capsule will be eatan by enemy (capsule next to enemy)
-        Raise(NotImplementedError("Heuristic Search low level "))
-        return [] # You should return a list of tuple of move action and target location (exclude current location).
+        myPos = gameState.getAgentPosition(self.index)
+        if highLevelAction == 'attack':
+            print(f"Agent {self.index} 执行 启发式【攻击】策略")
+            return self._planAttack(gameState, myPos, walls)
+        elif highLevelAction == 'go_home':
+            print(f"Agent {self.index} 执行 启发式【回家】策略")
+            return self._planGoHome(gameState, myPos, walls)
+        elif highLevelAction == 'defence':
+            print(f"Agent {self.index} 执行 启发式【防守】策略")
+            return self._planDefence(gameState, myPos, walls)
+        elif highLevelAction == 'patrol':
+            print(f"Agent {self.index} 执行 启发式【巡逻】策略")
+            return self._planPatrol(gameState, myPos, walls)
+        else:
+            return self._planAttack(gameState, myPos, walls)
+        
     
     def posSatisfyLowLevelPlan(self,gameState: GameState):
         if self.lowLevelPlan == None or len(self.lowLevelPlan)==0 or self.lowLevelActionIndex >= len(self.lowLevelPlan):
@@ -467,6 +597,233 @@ class MixedAgent(CaptureAgent):
         if nextPos != self.lowLevelPlan[self.lowLevelActionIndex][1]:
             return False
         return True
+    
+    #------------------------------- Heuristic search strategies Functions -------------------------------# ==================== Attack 策略 ====================
+    def _planAttack(self, gameState: GameState, myPos: Tuple, walls) -> List[Tuple[str, Tuple]]:
+        """进攻策略：找到最近的食物，同时避开敌人"""
+        food_list = self.getFood(gameState).asList()
+        ghosts = self.getGhostLocs(gameState)
+        capsules = self.getCapsules(gameState)
+        
+        # 检查是否有scared ghost可以追杀
+        enemies = [gameState.getAgentState(i) for i in self.getOpponents(gameState)]
+        scared_ghosts = [
+            e.getPosition() for e in enemies 
+            if not e.isPacman and e.getPosition() is not None and e.scaredTimer > 5
+        ]
+        
+        if scared_ghosts:
+            closest_scared = min(scared_ghosts, key=lambda g: self.getMazeDistance(myPos, g))
+            if self.getMazeDistance(myPos, closest_scared) <= 8:
+                path = self._astar(myPos, closest_scared, walls, ghosts, avoid_ghosts=False)
+                return path if path else self._getEmergencyMove(gameState, myPos, walls, ghosts)
+        
+        # 检查是否应该先吃胶囊
+        if capsules and ghosts:
+            closest_capsule = min(capsules, key=lambda c: self.getMazeDistance(myPos, c))
+            closest_ghost_dist = min(self.getMazeDistance(myPos, g) for g in ghosts)
+            capsule_dist = self.getMazeDistance(myPos, closest_capsule)
+            
+            if closest_ghost_dist <= 5 and capsule_dist <= 4:
+                path = self._astar(myPos, closest_capsule, walls, ghosts, avoid_ghosts=True)
+                return path if path else self._getEmergencyMove(gameState, myPos, walls, ghosts)
+        
+        # 正常进攻：找最近的食物
+        if not food_list:
+            return self._planGoHome(gameState, myPos, walls)
+        
+        # 分区策略
+        teamIndices = self.getTeam(gameState)
+        upperAgent = teamIndices[1] if self.red else teamIndices[0]
+        midY = walls.height // 2
+        
+        if self.index == upperAgent:
+            upper_food = [f for f in food_list if f[1] >= midY]
+            target_foods = upper_food if upper_food else food_list
+        else:
+            lower_food = [f for f in food_list if f[1] < midY]
+            target_foods = lower_food if lower_food else food_list
+        
+        # 找到最近的安全食物
+        best_food = None
+        best_score = float('inf')
+        
+        for food in target_foods[:10]:
+            food_dist = self.getMazeDistance(myPos, food)
+            danger_score = 0
+            if ghosts:
+                min_ghost_dist = min(self.getMazeDistance(food, g) for g in ghosts)
+                danger_score = max(0, 8 - min_ghost_dist)
+            
+            total_score = food_dist + danger_score * 2
+            if total_score < best_score:
+                best_score = total_score
+                best_food = food
+        
+        if best_food:
+            path = self._astar(myPos, best_food, walls, ghosts, avoid_ghosts=True)
+            return path if path else self._getEmergencyMove(gameState, myPos, walls, ghosts)
+        
+        return self._getEmergencyMove(gameState, myPos, walls, ghosts)
+
+
+    def _planGoHome(self, gameState: GameState, myPos: Tuple, walls) -> List[Tuple[str, Tuple]]:
+        """回家策略：找到最近的边境线"""
+        ghosts = self.getGhostLocs(gameState)
+        border_positions = self.borderCoordinates if hasattr(self, 'borderCoordinates') else []
+        
+        if not border_positions:
+            mid_x = walls.width // 2
+            if self.red:
+                mid_x = mid_x - 1
+            border_positions = [(mid_x, y) for y in range(walls.height) if not walls[mid_x][y]]
+        
+        # 找到最安全的边境点
+        best_border = None
+        best_score = float('inf')
+        
+        for border in border_positions:
+            border_dist = self.getMazeDistance(myPos, border)
+            danger_score = 0
+            if ghosts:
+                min_ghost_dist = min(self.getMazeDistance(border, g) for g in ghosts)
+                danger_score = max(0, 6 - min_ghost_dist)
+            
+            total_score = border_dist + danger_score * 3
+            if total_score < best_score:
+                best_score = total_score
+                best_border = border
+        
+        if best_border:
+            path = self._astar(myPos, best_border, walls, ghosts, avoid_ghosts=True, escape_mode=True)
+            return path if path else self._getEmergencyMove(gameState, myPos, walls, ghosts)
+        
+        return self._getEmergencyMove(gameState, myPos, walls, ghosts)
+
+
+    def _planDefence(self, gameState: GameState, myPos: Tuple, walls) -> List[Tuple[str, Tuple]]:
+        """防守策略：拦截入侵者"""
+        enemies = [gameState.getAgentState(i) for i in self.getOpponents(gameState)]
+        invaders = [e for e in enemies if e.isPacman and e.getPosition() is not None]
+        
+        if invaders:
+            closest_invader = min(invaders, key=lambda e: self.getMazeDistance(myPos, e.getPosition()))
+            target = closest_invader.getPosition()
+            path = self._astar(myPos, target, walls, [], avoid_ghosts=False)
+            return path if path else self._getEmergencyMove(gameState, myPos, walls, [])
+        else:
+            return self._planPatrol(gameState, myPos, walls)
+
+
+    def _planPatrol(self, gameState: GameState, myPos: Tuple, walls) -> List[Tuple[str, Tuple]]:
+        """巡逻策略：在己方领地边境巡逻"""
+        import random
+        
+        border_positions = self.borderCoordinates if hasattr(self, 'borderCoordinates') else []
+        
+        if not border_positions:
+            mid_x = walls.width // 2
+            if self.red:
+                mid_x = mid_x - 1
+            border_positions = [(mid_x, y) for y in range(walls.height) if not walls[mid_x][y]]
+        
+        # 选择距离在5-15之间的巡逻点
+        patrol_targets = [b for b in border_positions if 5 <= self.getMazeDistance(myPos, b) <= 15]
+        
+        if not patrol_targets:
+            patrol_targets = border_positions
+        
+        target = random.choice(patrol_targets) if patrol_targets else border_positions[len(border_positions)//2]
+        
+        path = self._astar(myPos, target, walls, [], avoid_ghosts=False)
+        return path if path else self._getEmergencyMove(gameState, myPos, walls, [])
+
+
+    def _astar(self, start: Tuple, goal: Tuple, walls, ghosts: List[Tuple], 
+            avoid_ghosts: bool = True, escape_mode: bool = False) -> List[Tuple[str, Tuple]]:
+        """
+        A*搜索算法
+        返回: [(action, position), ...] - 从start到goal的路径
+        """
+        import heapq
+        
+        frontier = []
+        heapq.heappush(frontier, (0, 0, start, []))
+        visited = {start: 0}
+        
+        # Ghost危险区域
+        ghost_danger_zone = set()
+        if avoid_ghosts and ghosts:
+            danger_radius = 3 if escape_mode else 2
+            for ghost in ghosts:
+                for dx in range(-danger_radius, danger_radius + 1):
+                    for dy in range(-danger_radius, danger_radius + 1):
+                        x, y = int(ghost[0]) + dx, int(ghost[1]) + dy
+                        if 0 <= x < walls.width and 0 <= y < walls.height:
+                            if not walls[x][y]:
+                                ghost_danger_zone.add((x, y))
+        
+        max_iterations = 1000
+        iterations = 0
+        
+        while frontier and iterations < max_iterations:
+            iterations += 1
+            _, g_score, current, path = heapq.heappop(frontier)
+            
+            if current == goal:
+                return path
+            
+            for action in [Directions.NORTH, Directions.SOUTH, Directions.EAST, Directions.WEST]:
+                next_pos = Actions.getSuccessor(current, action)
+                x, y = int(next_pos[0]), int(next_pos[1])
+                
+                if walls[x][y]:
+                    continue
+                
+                move_cost = 1
+                if next_pos in ghost_danger_zone:
+                    move_cost += 50 if escape_mode else 10
+                if next_pos == current:
+                    move_cost += 100
+                
+                new_g_score = g_score + move_cost
+                
+                if next_pos not in visited or new_g_score < visited[next_pos]:
+                    visited[next_pos] = new_g_score
+                    h_score = self.getMazeDistance(next_pos, goal)
+                    f_score = new_g_score + h_score
+                    new_path = path + [(action, next_pos)]
+                    heapq.heappush(frontier, (f_score, new_g_score, next_pos, new_path))
+        
+        return None
+
+
+    def _getEmergencyMove(self, gameState: GameState, myPos: Tuple, walls, ghosts: List[Tuple]) -> List[Tuple[str, Tuple]]:
+        """应急方案：选择一个远离敌人的合法移动"""
+        legal_actions = gameState.getLegalActions(self.index)
+        legal_actions = [a for a in legal_actions if a != Directions.STOP]
+        
+        if not legal_actions:
+            return [(Directions.STOP, myPos)]
+        
+        best_action = None
+        best_score = -float('inf')
+        
+        for action in legal_actions:
+            next_pos = Actions.getSuccessor(myPos, action)
+            
+            if ghosts:
+                min_ghost_dist = min(self.getMazeDistance(next_pos, g) for g in ghosts)
+                score = min_ghost_dist
+            else:
+                score = 0
+            
+            if score > best_score:
+                best_score = score
+                best_action = action
+        
+        next_pos = Actions.getSuccessor(myPos, best_action)
+        return [(best_action, next_pos)]
 
     #------------------------------- Q-learning low level plan Functions -------------------------------
 
@@ -482,19 +839,6 @@ class MixedAgent(CaptureAgent):
         featureFunction = None
         weights = None
         learningRate = 0
-        myState = gameState.getAgentState(self.index)
-        myPos = myState.getPosition()
-        # 检测边界徘徊问题
-        if not hasattr(self, 'border_hesitation_counter'):
-            self.border_hesitation_counter = 0
-            self.last_pos = myPos
-        
-        # 如果在边界附近停留太久
-        if abs(myPos[0] - self.last_pos[0]) + abs(myPos[1] - self.last_pos[1]) <= 1:
-            self.border_hesitation_counter += 1
-        else:
-            self.border_hesitation_counter = 0
-        self.last_pos = myPos
 
         ##########
         # The following classification of high level actions is only a example.
@@ -504,64 +848,10 @@ class MixedAgent(CaptureAgent):
             # The q learning process for offensive actions are complete, 
             # you can improve getOffensiveFeatures to collect more useful feature to pass more information to Q learning model
             # you can improve the getOffensiveReward function to give reward for new features and improve the trainning process .
-            # 如果已经是Pacman，继续正常执行
-            
-            if myState.isPacman:
-                rewardFunction = self.getOffensiveReward
-                featureFunction = self.getOffensiveFeatures
-                weights = self.getOffensiveWeights()
-                learningRate = self.alpha
-            else:
-                # 如果是Ghost状态，强制向敌方领地移动
-                walls = gameState.getWalls()
-                width = walls.width
-                border_x = (width // 2) if self.red else (width // 2 - 1)
-                
-                # 如果在边界徘徊超过3步，强制跨线
-                if self.border_hesitation_counter > 3 or abs(myPos[0] - border_x) <= 1:
-                    print(f"Agent {self.index}: 强制跨越边界！")
-                    
-                    # # 方案：评估所有非 STOP 动作，使得到边界的迷宫距离最小（可自动识别死胡同需先后退）
-                    # candidate_actions = [a for a in legalActions if a != Directions.STOP]
-                    # if candidate_actions:
-                    #     best_actions = []
-                    #     best_dist = float('inf')
-                    #     for cand in candidate_actions:
-                    #         np = Actions.getSuccessor(myPos, cand)
-                    #         d = self.getDistanceToBorder(np)
-                    #         if d < best_dist:
-                    #             best_dist = d
-                    #             best_actions = [cand]
-                    #         elif d == best_dist:
-                    #             best_actions.append(cand)
-
-                    #     # 在同等“最优”中，尽量优先选择朝边界方向的一步
-                    #     prefer = []
-                    #     for a in best_actions:
-                    #         np = Actions.getSuccessor(myPos, a)
-                    #         if (self.red and np[0] > myPos[0]) or ((not self.red) and np[0] < myPos[0]):
-                    #             prefer.append(a)
-
-                    #     action = random.choice(prefer if prefer else best_actions)
-                    
-                    # 过滤出能跨越边界的动作
-                    cross_border_actions = []
-                    for action in legalActions:
-                        nextPos = Actions.getSuccessor(myPos, action)
-                        # 红队要向右（x增大），蓝队要向左（x减小）
-                        if self.red and nextPos[0] > myPos[0]:
-                            cross_border_actions.append(action)
-                        elif not self.red and nextPos[0] < myPos[0]:
-                            cross_border_actions.append(action)
-                    
-                    if cross_border_actions:
-                        action = random.choice(cross_border_actions)
-                        nextPos = Actions.getSuccessor(myPos, action)
-                        return [(action, nextPos)]
-                rewardFunction = self.getOffensiveReward
-                featureFunction = self.getOffensiveFeatures
-                weights = self.getOffensiveWeights()
-                learningRate = self.alpha
+            rewardFunction = self.getOffensiveReward
+            featureFunction = self.getOffensiveFeatures
+            weights = self.getOffensiveWeights()
+            learningRate = self.alpha
         elif highLevelAction == "go_home":
             # 逃回家时暂时禁用 stop TODO
             non_stop = [a for a in legalActions if a != Directions.STOP]
@@ -594,40 +884,6 @@ class MixedAgent(CaptureAgent):
                         values.append((self.getQValue(featureFunction(gameState, action), weights), action))
                 action = max(values)[1]
         myPos = gameState.getAgentPosition(self.index)
-
-        # --- 通用卡住兜底：若近期位置重复/摆动，则用 BFS 规划一步避墙而行 ---
-        if not hasattr(self, 'recent_positions'):
-            self.recent_positions = []
-        self.recent_positions.append((int(myPos[0]), int(myPos[1])))
-        if len(self.recent_positions) > 6:
-            self.recent_positions.pop(0)
-        stuck = False
-        if len(self.recent_positions) >= 4:
-            last4 = self.recent_positions[-4:]
-            if len(set(last4)) <= 2:
-                stuck = True
-
-        if stuck:
-            bfs_choice = None
-            if gameState.getAgentState(self.index).isPacman:
-                # 进攻时：规划到目标半区的食物，否则全局食物
-                walls = gameState.getWalls()
-                midY = walls.height // 2
-                food_list = self.getFood(gameState).asList()
-                teamIndices = self.getTeam(gameState)
-                upperAgent = teamIndices[1] if self.red else teamIndices[0]
-                if self.index == upperAgent:
-                    targets = [p for p in food_list if int(p[1]) >= midY] or food_list
-                else:
-                    targets = [p for p in food_list if int(p[1]) < midY] or food_list
-                bfs_choice = self.bfsNextStepToAny(gameState, targets)
-            else:
-                # 跨边界/回家时：规划到最近边界点
-                bfs_choice = self.bfsNextStepToAny(gameState, getattr(self, 'borderCoordinates', []))
-            if bfs_choice:
-                action, nextPos = bfs_choice
-                return [(action, nextPos)]
-
         nextPos = Actions.getSuccessor(myPos,action)
         return [(action, nextPos)]
 
@@ -683,6 +939,7 @@ class MixedAgent(CaptureAgent):
         ghosts = self.getGhostLocs(gameState)
         ghost_1_step = sum(nextAgentState.getPosition() in Actions.getLegalNeighbors(g,gameState.getWalls()) for g in ghosts)
         food_list = self.getFood(gameState).asList()
+        walls = gameState.getWalls()
         base_reward =  -50 + nextAgentState.numReturned + nextAgentState.numCarrying
         new_food_returned = nextAgentState.numReturned - currentAgentState.numReturned
         score = self.getScore(nextState)
@@ -787,9 +1044,9 @@ class MixedAgent(CaptureAgent):
         #     base_reward += new_food_returned * 50
             
         # 获取距离地图中心点的距离, 接近家给奖励
-        curr_dist_to_middle = self.getMazeDistance(currentAgentState.getPosition(), (middle_x, middle_y))
-        next_dist_to_middle = self.getMazeDistance(nextAgentState.getPosition(), (middle_x, middle_y))
-        if next_dist_to_middle < curr_dist_to_middle:
+        curr_dist_to_border = self.getDistanceToBorder(currentAgentState.getPosition())
+        next_dist_to_border = self.getDistanceToBorder(nextAgentState.getPosition())
+        if next_dist_to_border < curr_dist_to_border:
             base_reward += 5
         else:
             base_reward -= 5
@@ -813,13 +1070,15 @@ class MixedAgent(CaptureAgent):
     def getOffensiveFeatures(self, gameState: GameState, action):
         food = self.getFood(gameState) 
         currAgentState = gameState.getAgentState(self.index)
-
+        myPos = currAgentState.getPosition()
+        
         walls = gameState.getWalls()
         ghosts = self.getGhostLocs(gameState)
         
         # Initialize features
         features = util.Counter()
         nextState = self.getSuccessor(gameState, action)
+        nextAgentState: AgentState = nextState.getAgentState(self.index)
 
         # Successor Score
         features['successorScore'] = self.getScore(nextState)/(walls.width+walls.height)
@@ -890,17 +1149,29 @@ class MixedAgent(CaptureAgent):
             features['stop'] = 0
 
         rev = Directions.REVERSE[gameState.getAgentState(self.index).configuration.direction]
-        if action == rev: 
-            features['reverse'] = 1
-        else:
-            features['reverse'] = 0
+        nbrs_here = Actions.getLegalNeighbors(myPos, gameState.getWalls())
+        is_deadend_here = (len(nbrs_here) == 1) # 如果只有一个邻居，则认为是死胡同, 允许回头
+        features['reverse'] = 1 if (action == rev and not is_deadend_here) else 0
+            
+        # ============ 新增features ============
+    
+        # 1. 时间紧迫度 (归一化到 0-1)
+        # timeRemaining = gameState.data.timeleft
+        # if timeRemaining > 600:
+        #     features['time-urgency'] = 0.0
+        # elif timeRemaining > 300:
+        #     features['time-urgency'] = 0.3
+        # elif timeRemaining > 150:
+        #     features['time-urgency'] = 0.6
+        # else:
+        #     features['time-urgency'] = 1.0
+      
         return features
     
 
     def getOffensiveWeights(self):
         return MixedAgent.QLWeights["offensiveWeights"]
     
-
 
     def getEscapeFeatures(self, gameState, action):
         features = util.Counter()
@@ -968,9 +1239,9 @@ class MixedAgent(CaptureAgent):
             
         return features
 
+
     def getEscapeWeights(self):
         return MixedAgent.QLWeights["escapeWeights"]
-    
 
 
     def getDefensiveFeatures(self, gameState, action):
@@ -1046,11 +1317,11 @@ class MixedAgent(CaptureAgent):
         else:
             features['stop'] = 0.0
         rev = Directions.REVERSE[gameState.getAgentState(self.index).configuration.direction]
-        if action == rev: 
-            features['reverse'] = 1.0
-        else:
-            features['reverse'] = 0.0
+        nbrs_here = Actions.getLegalNeighbors(myPos, gameState.getWalls())
+        is_deadend_here = (len(nbrs_here) == 1) # 如果只有一个邻居，则认为是死胡同, 允许回头
+        features['reverse'] = 1 if (action == rev and not is_deadend_here) else 0
         return features
+
 
     def getDefensiveWeights(self):
         return MixedAgent.QLWeights["defensiveWeights"]
@@ -1072,55 +1343,6 @@ class MixedAgent(CaptureAgent):
                 fringe.append((nbr_x, nbr_y, dist+1))
         # no food found
         return None
-
-    def bfsNextStepToAny(self, gameState: GameState, goals):
-        """
-        计算从当前位置到任一目标点的最短路径的第一步动作；若无路径或目标为空返回 None。
-        """
-        if not goals:
-            return None
-        walls = gameState.getWalls()
-        start = gameState.getAgentPosition(self.index)
-        if not start:
-            return None
-        sx, sy = int(start[0]), int(start[1])
-        start_int = (sx, sy)
-        goals_set = set((int(x), int(y)) for x, y in goals)
-
-        # 若已在目标上，不需动作
-        if start_int in goals_set:
-            return None
-
-        from collections import deque
-        fringe = deque([start_int])
-        parent = {start_int: None}
-        found = None
-        while fringe:
-            cx, cy = fringe.popleft()
-            if (cx, cy) in goals_set:
-                found = (cx, cy)
-                break
-            for nx, ny in Actions.getLegalNeighbors((cx, cy), walls):
-                npos = (int(nx), int(ny))
-                if npos not in parent:
-                    parent[npos] = (cx, cy)
-                    fringe.append(npos)
-
-        if not found:
-            return None
-
-        # 回溯第一步
-        cur = found
-        prev = parent[cur]
-        while prev and parent[prev] is not None:
-            cur = prev
-            prev = parent[cur]
-
-        # cur 现在是从 start 出发的第一步位置
-        dx, dy = cur[0] - sx, cur[1] - sy
-        direction = Actions.vectorToDirection((dx, dy))
-        nextPos = Actions.getSuccessor(start, direction)
-        return (direction, nextPos)
     
     def stateClosestFood(self, gameState:GameState):
         pos = gameState.getAgentPosition(self.index)

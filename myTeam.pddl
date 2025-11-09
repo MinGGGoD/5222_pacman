@@ -65,14 +65,25 @@
     (:action attack
         :parameters (?a - current_agent ?e1 - enemy1 ?e2 - enemy2 )
         :precondition (and 
-            (not (is_pacman ?e1)) 
-            (not (is_pacman ?e2)) 
             (food_available)
         )
         :effect (and 
-            (not (food_available))
+            (3_food_in_backpack ?a)
+            (is_pacman ?a)
         )
     )
+
+    (:action attack_aggressive
+        :parameters (?a - current_agent ?e1 - enemy1 ?e2 - enemy2 )
+        :precondition (and 
+            (food_available)
+        )
+        :effect (and 
+            (food_in_backpack ?a)
+            (is_pacman ?a)
+        )
+    )
+
 
     (:action defence
         :parameters (?a - current_agent ?e - enemy)
@@ -100,7 +111,7 @@
             (not (is_pacman ?a))
             (not (is_pacman ?e1))
             (not (is_pacman ?e2))
-            (winning_gt10)
+            (winning)
         )
         :effect (and 
             (defend_foods)
