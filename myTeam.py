@@ -41,7 +41,7 @@ from lib_piglet.utils.pddl_solver import pddl_solver
 from lib_piglet.domains.pddl import pddl_state
 from lib_piglet.utils.pddl_parser import Action
 
-CLOSE_DISTANCE = 4
+CLOSE_DISTANCE = 3
 MEDIUM_DISTANCE = 15
 LONG_DISTANCE = 25
 
@@ -308,6 +308,9 @@ class MixedAgent(CaptureAgent):
 
         # Collect team agents states
         agents : List[Tuple[int,AgentState]] = [(i,gameState.getAgentState(i)) for i in self.getTeam(gameState)]
+        walls = gameState.getWalls()
+        border_x = (walls.width // 2) - 1 if self.red else walls.width // 2
+        
         for agent_index, agent_state in agents :
             agent_object = "a{}".format(agent_index)
             agent_type = "current_agent" if agent_index == self.index else "ally"
@@ -333,6 +336,58 @@ class MixedAgent(CaptureAgent):
             if agent_state.isPacman:
                 states.append(("is_pacman",agent_object))
             
+            # ========== 协作谓词：收集队友的当前动作 ==========
+            if agent_index != self.index:  # 只处理队友，不包括自己
+                ally_pos = agent_state.getPosition()
+                if ally_pos is not None:
+                    ally_x, ally_y = int(ally_pos[0]), int(ally_pos[1])
+                    
+                    # 1. (eat_enemy ?a - ally) - 队友正在吃敌人（scared ghost）
+                    # 判断：队友是pacman，且附近有scared ghost
+                    if agent_state.isPacman:
+                        enemies = [gameState.getAgentState(i) for i in self.getOpponents(gameState)]
+                        scared_ghosts = [
+                            e for e in enemies 
+                            if not e.isPacman and e.getPosition() is not None and e.scaredTimer > 5
+                        ]
+                        for scared_ghost in scared_ghosts:
+                            if self.getMazeDistance(ally_pos, scared_ghost.getPosition()) <= 3:
+                                states.append(("eat_enemy", agent_object))
+                                break
+                    
+                    # 2. (go_home ?a - ally) - 队友正在回家
+                    # 判断：队友是pacman，且携带食物，且当前位置在敌方领地（正在向己方移动）
+                    if agent_state.isPacman and agent_state.numCarrying > 0:
+                        # 判断是否在敌方领地（根据x坐标）
+                        is_in_enemy_land = (self.red and ally_x >= border_x + 1) or (not self.red and ally_x <= border_x)
+                        if is_in_enemy_land:
+                            states.append(("go_home", agent_object))
+                    
+                    # 3. (go_enemy_land ?a - ally) - 队友正在去敌方领地
+                    # 判断：队友不是pacman，且当前位置在己方领地（准备去敌方）
+                    if not agent_state.isPacman:
+                        # 判断是否在己方领地
+                        is_in_home = (self.red and ally_x <= border_x) or (not self.red and ally_x > border_x)
+                        if is_in_home:
+                            states.append(("go_enemy_land", agent_object))
+                    
+                    # 4. (eat_capsule ?a - ally) - 队友正在吃胶囊
+                    # 判断：队友是pacman，且附近有胶囊
+                    if agent_state.isPacman:
+                        capsules = self.getCapsules(gameState)
+                        for capsule in capsules:
+                            if self.getMazeDistance(ally_pos, capsule) <= CLOSE_DISTANCE:
+                                states.append(("eat_capsule", agent_object))
+                                break
+                    
+                    # 5. (eat_food ?a - ally) - 队友正在吃食物
+                    # 判断：队友是pacman，且附近有食物
+                    if agent_state.isPacman:
+                        food_list = self.getFood(gameState).asList()
+                        for food in food_list:
+                            if self.getMazeDistance(ally_pos, food) <= CLOSE_DISTANCE:
+                                states.append(("eat_food", agent_object))
+                                break
             
 
         # Collect enemy agents states
@@ -402,6 +457,7 @@ class MixedAgent(CaptureAgent):
         # 当前agent
         cur_agent_state = gameState.getAgentState(self.index)
         carrying_count = cur_agent_state.numCarrying
+        walls = gameState.getWalls()
         
         # 检查是否携带了足够的食物
         for fact in initState:
@@ -419,7 +475,7 @@ class MixedAgent(CaptureAgent):
         if border_positions:
             dist_to_home = min(self.getMazeDistance(myPos, b) for b in border_positions)
         else:
-            dist_to_home = 10  # 估计值
+            dist_to_home = walls.width // 2  # 估计值
         
         # ==================== 优先级1: 时间紧迫策略 ====================
         if timeRemaining < 100:
@@ -433,7 +489,7 @@ class MixedAgent(CaptureAgent):
                     positiveGoal = []
                     negtiveGoal = [("is_pacman", myObj)]
                     return positiveGoal, negtiveGoal
-                else: # 巡逻
+                else: # 巡逻or防守
                     return self.goalDefWinning(objects, initState)
             elif currentScore < 0:
                 # 落后：必须冒险拿1分
@@ -471,7 +527,8 @@ class MixedAgent(CaptureAgent):
                     return self.goalDefWinning(objects, initState)
             elif currentScore < 0:
                 # 落后：需要积极进攻，但携带2个以上就回家
-                if carrying_count >= 2 or (carrying_count > 0 and dist_to_home > 15):
+                max_home_dist = min(15, walls.width // 2)
+                if carrying_count >= 2 or (carrying_count > 0 and dist_to_home > max_home_dist):
                     print(f'Agent {self.index}: 时间<250且落后({currentScore}), 携带{carrying_count}个且距离{dist_to_home}，回家')
                     positiveGoal = []
                     negtiveGoal = [("is_pacman", myObj)]
@@ -510,6 +567,11 @@ class MixedAgent(CaptureAgent):
             for i in myAgentsIndices:
                 negtiveGoal += [("is_pacman", "a{}".format(i))]
             return positiveGoal, negtiveGoal
+        
+        # ==================== 优先级4.1: 如果离地人比较近, 转防守 ==========
+        if ('enemy_around',) in initState:
+            print(f'Agent {self.index}: 检测到敌人, 转防守')
+            return self.goalDefWinning(objects, initState)
         
         # ==================== 优先级5: 默认进攻 ====================
         # 检查是否应该更激进（落后时）
@@ -551,11 +613,36 @@ class MixedAgent(CaptureAgent):
     def goalDefWinning(self,objects: List[Tuple], initState: List[Tuple]):
         # If winning greater than 5 points,
         # this example want defend foods only, and let agents patrol on our ground.
-        # The "win_the_game" pddl state is only reachable by the "patrol" action in pddl,
+        # The "defend_foods" pddl state is only reachable by the "patrol" action in pddl,
         # using it as goal, pddl will generate plan eliminate invading enemy and patrol on our ground.
-
-        positiveGoal = [("defend_foods",)]
+        
+        current_agent_obj = "a{}".format(self.index)
+        
+        # 检查是否有敌人入侵（敌人是pacman）
+        has_invader = False
         negtiveGoal = []
+        
+        for obj in objects:
+            agent_obj = obj[0]
+            agent_type = obj[1]
+            
+            if agent_type == "enemy1" or agent_type == "enemy2":
+                # 检查敌人是否是pacman（在initState中）
+                if ("is_pacman", agent_obj) in initState:
+                    has_invader = True
+                    # 设置goal：要求敌人不是pacman（通过defence action达到）
+                    negtiveGoal.append(("is_pacman", agent_obj))
+        
+        if has_invader:
+            # 有入侵者：使用defence action消除入侵者
+            positiveGoal = []
+            # negtiveGoal已经设置：要求所有入侵的敌人不是pacman
+            print(f'Agent {self.index}: 检测到入侵者，设置defence goal: {negtiveGoal}')
+        else:
+            # 没有入侵者：使用patrol action巡逻
+            positiveGoal = [("defend_foods",)]
+            negtiveGoal = []
+            print(f'Agent {self.index}: 没有入侵者，设置patrol goal')
         
         return positiveGoal, negtiveGoal
     
@@ -569,6 +656,7 @@ class MixedAgent(CaptureAgent):
 
         walls = gameState.getWalls() # a 2d array matrix of obstacles, map[x][y] = true means a obstacle(wall) on x,y, map[x][y] = false indicate a free location
         foods = self.getFood(gameState) # a 2d array matrix of food,  foods[x][y] = true if there's a food.
+        
         capsules = self.getCapsules(gameState) # a list of capsules
         foodNeedDefend = self.getFoodYouAreDefending(gameState) # return food will be eatan by enemy (food next to enemy)
         capsuleNeedDefend = self.getCapsulesYouAreDefending(gameState) # return capsule will be eatan by enemy (capsule next to enemy)
@@ -585,7 +673,7 @@ class MixedAgent(CaptureAgent):
         elif highLevelAction == 'patrol':
             print(f"Agent {self.index} 执行 启发式【巡逻】策略")
             return self._planPatrol(gameState, myPos, walls)
-        else:
+        else: # default attack strategy
             return self._planAttack(gameState, myPos, walls)
         
     
@@ -632,30 +720,38 @@ class MixedAgent(CaptureAgent):
         if not food_list:
             return self._planGoHome(gameState, myPos, walls)
         
-        # 分区策略
-        teamIndices = self.getTeam(gameState)
-        upperAgent = teamIndices[1] if self.red else teamIndices[0]
-        midY = walls.height // 2
+        # 分区策略：根据食物的离散程度决定是否分区
+        target_foods = self._shouldPartition(food_list, walls, gameState)
         
-        if self.index == upperAgent:
-            upper_food = [f for f in food_list if f[1] >= midY]
-            target_foods = upper_food if upper_food else food_list
-        else:
-            lower_food = [f for f in food_list if f[1] < midY]
-            target_foods = lower_food if lower_food else food_list
+        # ========== 评估食物的安全性 ==========
+        safe_foods = []
+        for food in target_foods:
+            if not self._isDeadEndTrap(food, walls, ghosts):
+                safe_foods.append(food)
         
-        # 找到最近的安全食物
+        # 如果所有食物都不安全，就选择危险度最低的
+        if not safe_foods:
+            safe_foods = target_foods
+        
+        # 找到最优食物
         best_food = None
         best_score = float('inf')
         
-        for food in target_foods[:10]:
+        for food in safe_foods[:15]:  # 考虑前15个
             food_dist = self.getMazeDistance(myPos, food)
+            
+            # 计算危险度
             danger_score = 0
             if ghosts:
                 min_ghost_dist = min(self.getMazeDistance(food, g) for g in ghosts)
-                danger_score = max(0, 8 - min_ghost_dist)
+                danger_score = max(0, 10 - min_ghost_dist)
             
-            total_score = food_dist + danger_score * 2
+            # 计算死胡同深度惩罚
+            deadend_penalty = self._getDeadEndDepth(food, walls)
+            
+            # 综合评分
+            total_score = food_dist + danger_score * 3 + deadend_penalty * 2
+            
             if total_score < best_score:
                 best_score = total_score
                 best_food = food
@@ -740,10 +836,10 @@ class MixedAgent(CaptureAgent):
 
 
     def _astar(self, start: Tuple, goal: Tuple, walls, ghosts: List[Tuple], 
-            avoid_ghosts: bool = True, escape_mode: bool = False) -> List[Tuple[str, Tuple]]:
+           avoid_ghosts: bool = True, escape_mode: bool = False) -> List[Tuple[str, Tuple]]:
         """
-        A*搜索算法
-        返回: [(action, position), ...] - 从start到goal的路径
+        A*搜索算法 with 死胡同避免
+        Return: [(action, position), ...] - 从start到goal的路径
         """
         import heapq
         
@@ -763,6 +859,24 @@ class MixedAgent(CaptureAgent):
                             if not walls[x][y]:
                                 ghost_danger_zone.add((x, y))
         
+        # ========== 预计算死胡同区域 ==========
+        deadend_zones = set()
+        if ghosts:
+            # 只在有ghost时才计算
+            for x in range(walls.width):
+                for y in range(walls.height):
+                    pos = (x, y)
+                    if not walls[x][y]:
+                        neighbors = Actions.getLegalNeighbors(pos, walls)
+                        # 死胡同：只有1个邻居
+                        if len(neighbors) <= 1:
+                            deadend_zones.add(pos)
+                        # 狭窄通道：2个邻居且附近有ghost
+                        elif len(neighbors) == 2 and ghosts:
+                            min_ghost_dist = min(self.getMazeDistance(pos, g) for g in ghosts)
+                            if min_ghost_dist <= 5:
+                                deadend_zones.add(pos)
+        
         max_iterations = 1000
         iterations = 0
         
@@ -780,9 +894,31 @@ class MixedAgent(CaptureAgent):
                 if walls[x][y]:
                     continue
                 
+                # 计算移动代价
                 move_cost = 1
+                
+                # Ghost危险区域增加代价
                 if next_pos in ghost_danger_zone:
                     move_cost += 50 if escape_mode else 10
+                
+                # ========== 死胡同惩罚 ==========
+                if next_pos in deadend_zones:
+                    # 如果目标就在死胡同里，且距离很近，可以接受
+                    if next_pos == goal and self.getMazeDistance(current, goal) <= 2:
+                        move_cost += 5  # 轻微惩罚
+                    else:
+                        # 否则大幅增加代价
+                        move_cost += 100
+                
+                # 检查是否进入死路（邻居很少）
+                neighbors = Actions.getLegalNeighbors(next_pos, walls)
+                if len(neighbors) <= 2 and ghosts:
+                    # 在狭窄区域且有ghost，增加代价
+                    min_ghost_dist = min(self.getMazeDistance(next_pos, g) for g in ghosts)
+                    if min_ghost_dist <= 6:
+                        move_cost += 30
+                
+                # 避免原地不动
                 if next_pos == current:
                     move_cost += 100
                 
@@ -797,6 +933,60 @@ class MixedAgent(CaptureAgent):
         
         return None
 
+    def _shouldPartition(self, food_list: List[Tuple], walls, gameState: GameState) -> List[Tuple]:
+        """
+        根据食物的离散程度决定是否分区
+        如果食物分布很分散，则分区；如果食物集中，则不分区
+        
+        Args:
+            food_list: 食物位置列表
+            walls: 地图墙壁对象
+            gameState: 游戏状态对象
+            
+        Returns:
+            该agent应该关注的食物列表
+        """
+        if not food_list or len(food_list) <= 3:
+            # 食物太少，不需要分区
+            return food_list
+        
+        # 计算食物在Y轴上的分布范围
+        y_coords = [food[1] for food in food_list]
+        min_y = min(y_coords)
+        max_y = max(y_coords)
+        y_range = max_y - min_y
+        
+        # 计算离散程度：分布范围相对于地图高度的比例
+        # 如果食物分布范围超过地图高度的40%，认为食物分散，应该分区
+        dispersion_threshold = 0.4
+        y_dispersion = y_range / walls.height if walls.height > 0 else 0
+        
+        # 如果地图太小（高度<=10），也不分区
+        if walls.height < 10:
+            print('地图太小,不分区')
+            return food_list
+        
+        # 如果食物分布很集中（离散程度低），不分区
+        print('食物分布离散程度:', y_dispersion)
+        if y_dispersion < dispersion_threshold:
+            print('食物分布很集中,不分区')
+            return food_list
+        
+        # 食物分布分散，进行分区
+        teamIndices = self.getTeam(gameState)
+        upperAgent = teamIndices[1] if self.red else teamIndices[0]
+        midY = walls.height // 2
+        
+        if self.index == upperAgent:
+            # 上半区agent
+            upper_food = [f for f in food_list if f[1] >= midY]
+            target_foods = upper_food if upper_food else food_list
+        else:
+            # 下半区agent
+            lower_food = [f for f in food_list if f[1] < midY]
+            target_foods = lower_food if lower_food else food_list
+        
+        return target_foods
 
     def _getEmergencyMove(self, gameState: GameState, myPos: Tuple, walls, ghosts: List[Tuple]) -> List[Tuple[str, Tuple]]:
         """应急方案：选择一个远离敌人的合法移动"""
@@ -824,6 +1014,111 @@ class MixedAgent(CaptureAgent):
         
         next_pos = Actions.getSuccessor(myPos, best_action)
         return [(best_action, next_pos)]
+    
+    # ==================== 死胡同检测函数 ====================
+
+    def _isDeadEndTrap(self, position: Tuple, walls, ghosts: List[Tuple]) -> bool:
+        """
+        检查某个位置是否是死胡同陷阱
+        
+        判断标准：
+        1. 位置本身是死胡同或狭窄区域
+        2. 且有ghost在逃生路径上
+        
+        返回: True = 危险的死胡同陷阱, False = 安全
+        """
+        if not ghosts:
+            return False
+        
+        # 检查是否是死胡同
+        neighbors = Actions.getLegalNeighbors(position, walls)
+        
+        if len(neighbors) <= 1:
+            # 完全的死胡同
+            return True
+        
+        if len(neighbors) == 2:
+            # 狭窄通道，需要进一步检查
+            # 计算到最近ghost的距离
+            min_ghost_dist = min(self.getMazeDistance(position, g) for g in ghosts)
+            
+            if min_ghost_dist <= 4:
+                # Ghost很近且在狭窄区域，危险
+                return True
+            
+            # 检查逃生路径是否被堵
+            escape_routes = self._getEscapeRoutes(position, walls, depth=5)
+            if len(escape_routes) <= 1:
+                # 只有一条逃生路线，容易被堵
+                if min_ghost_dist <= 6:
+                    return True
+        
+        return False
+
+
+    def _getDeadEndDepth(self, position: Tuple, walls) -> int:
+        """
+        计算位置的死胡同深度
+        
+        返回: 从该位置需要多少步才能到达开阔区域
+            0 = 开阔区域 (3+个出口)
+            1-5 = 轻度死胡同
+            6+ = 深度死胡同 (非常危险)
+        """
+        visited = set()
+        queue = [(position, 0)]
+        visited.add(position)
+        
+        while queue:
+            pos, depth = queue.pop(0)
+            
+            # 检查是否到达开阔区域
+            neighbors = Actions.getLegalNeighbors(pos, walls)
+            if len(neighbors) >= 3:
+                return depth
+            
+            # 限制搜索深度
+            if depth >= 10:
+                return 10
+            
+            # 继续搜索
+            for neighbor in neighbors:
+                if neighbor not in visited:
+                    visited.add(neighbor)
+                    queue.append((neighbor, depth + 1))
+        
+        return 10  # 极深的死胡同
+
+
+    def _getEscapeRoutes(self, position: Tuple, walls, depth: int = 5) -> List[Tuple]:
+        """
+        获取从某个位置的所有逃生路线
+        
+        返回: 深度为depth时所有可达的开阔区域位置
+        """
+        escape_positions = set()
+        visited = set()
+        queue = [(position, 0)]
+        visited.add(position)
+        
+        while queue:
+            pos, d = queue.pop(0)
+            
+            if d >= depth:
+                # 检查这个位置是否是开阔区域
+                neighbors = Actions.getLegalNeighbors(pos, walls)
+                if len(neighbors) >= 3:
+                    escape_positions.add(pos)
+                continue
+            
+            # 继续搜索
+            for neighbor in Actions.getLegalNeighbors(pos, walls):
+                if neighbor not in visited:
+                    visited.add(neighbor)
+                    queue.append((neighbor, d + 1))
+        
+        return list(escape_positions)
+
 
     #------------------------------- Q-learning low level plan Functions -------------------------------
 
