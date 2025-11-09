@@ -58,6 +58,8 @@
         (eat_capsule ?a - ally)
         (eat_food ?a - ally)
 
+        (greedy_eat_food ?a - current_agent)
+
     )
 
     ;define actions here
@@ -70,6 +72,16 @@
         :effect (and 
             (3_food_in_backpack ?a)
             (is_pacman ?a)
+        )
+    )
+
+    (:action attack_greedy
+        :parameters (?a - current_agent ?e1 - enemy1 ?e2 - enemy2 )
+        :precondition (and 
+            (food_available)
+        )
+        :effect (and 
+            (not (food_available))
         )
     )
 
@@ -108,13 +120,12 @@
     (:action patrol
         :parameters (?a - current_agent ?e1 - enemy1 ?e2 - enemy2)
         :precondition (and 
-            (is_pacman ?a)
             (not (is_pacman ?e1))
             (not (is_pacman ?e2))
-
         )
         :effect (and 
             (defend_foods)
+            (winning)
         )
     )
 

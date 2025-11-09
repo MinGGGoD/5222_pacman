@@ -469,6 +469,13 @@ class MixedAgent(CaptureAgent):
             if agent_state.isPacman:
                 states.append(("is_pacman", agent_object))
 
+            # if safe to eat food, set greedy_eat_food goal
+            has_enemy_around = any(
+                fact[0] == "enemy_around" and fact[2] == myObj for fact in states
+            )
+            if ("near_food", agent_object) in states and not has_enemy_around:
+                states.append(("greedy_eat_food", agent_object))
+
             # ========== Collaboration predicates: collect teammate's current actions ==========
             if agent_index != self.index:  # Only process teammates, exclude self
                 ally_pos = agent_state.getPosition()
@@ -640,11 +647,23 @@ class MixedAgent(CaptureAgent):
         carrying_count = cur_agent_state.numCarrying
         walls = gameState.getWalls()
 
-        # Check if carrying enough food
-        for fact in initState:
-            if len(fact) == 2 and fact[0] == "3_food_in_backpack" and fact[1] == myObj:
-                myCarrierGoal = True
-                break
+        # Check if carrying enough food (is not dangerous keep eating food)
+        has_enemy_around = any(
+            fact[0] == "enemy_around" and fact[2] == myObj for fact in initState
+        )
+        if ("greedy_eat_food", myObj) in initState:
+            # safe to eat food
+            myCarrierGoal = False
+        else:
+            # not safe to eat food, check if carrying enough food
+            for fact in initState:
+                if (
+                    len(fact) == 2
+                    and fact[0] == "3_food_in_backpack"
+                    and fact[1] == myObj
+                ):
+                    myCarrierGoal = True
+                    break
 
         # ==================== time awareness ====================
         timeRemaining = gameState.data.timeleft
@@ -781,8 +800,12 @@ class MixedAgent(CaptureAgent):
             )
             return self.goalScoringAggressive(objects, initState)
         else:
-            print(f"Agent {self.index}: normal attack mode")
-            return self.goalScoring(objects, initState)
+            if ("greedy_eat_food", myObj) in initState:
+                print(f"Agent {self.index}: greedy eat food mode")
+                return self.goalScoringGreedy(objects, initState)
+            else:
+                print(f"Agent {self.index}: normal attack mode")
+                return self.goalScoring(objects, initState)
 
     def goalScoring(self, objects: List[Tuple], initState: List[Tuple]):
         # If we are not winning more than 5 points,
@@ -812,8 +835,35 @@ class MixedAgent(CaptureAgent):
         myObj = "a{}".format(self.index)
 
         # Only require carrying food, ignore defense and eliminating all food
-        positiveGoal = [("is_pacman", myObj), ("3_food_in_backpack", myObj)]
-        negtiveGoal = []
+        if ("greedy_eat_food", myObj) in initState:
+            positiveGoal = []
+            negtiveGoal = [("food_available",)]
+        else:
+            # if myObj has food in backpack, go home first to secure victory
+            # has_enemy_around = any(
+            #     fact[0] == "enemy_around" and fact[2] == myObj for fact in initState
+            # )
+            if ("is_pacman", myObj) in initState and (
+                "food_in_backpack",
+                myObj,
+            ) in initState:
+                positiveGoal = []
+                negtiveGoal = [("is_pacman", myObj)]
+            else:  # no food in backpack, go attack no matter safe or not
+                positiveGoal = [("is_pacman", myObj), ("food_in_backpack", myObj)]
+                negtiveGoal = []
+
+        return positiveGoal, negtiveGoal
+
+    def goalScoringGreedy(self, objects: List[Tuple], initState: List[Tuple]):
+        """
+        Greedy eat food
+        """
+        myObj = "a{}".format(self.index)
+
+        # Only require carrying food, ignore defense and eliminating all food
+        positiveGoal = []
+        negtiveGoal = [("food_available",)]
 
         return positiveGoal, negtiveGoal
 
@@ -824,12 +874,21 @@ class MixedAgent(CaptureAgent):
         # using it as goal, pddl will generate plan eliminate invading enemy and patrol on our ground.
 
         current_agent_obj = "a{}".format(self.index)
+        another_agent_obj = None
+        if self.index == 0:
+            another_agent_obj = "a2"
+        elif self.index == 1:
+            another_agent_obj = "a3"
+        elif self.index == 2:
+            another_agent_obj = "a0"
+        elif self.index == 3:
+            another_agent_obj = "a1"
 
         # Check if there are enemy invaders (enemy is pacman)
         has_invader = False
         negtiveGoal = []
 
-        # default eat enemies
+        # default eat enemies no matter defense or patrol
         for obj in objects:
             agent_obj = obj[0]
             agent_type = obj[1]
@@ -850,8 +909,12 @@ class MixedAgent(CaptureAgent):
             )
         else:
             # No invaders: use patrol action to patrol
+            # Note: Only set goal for current agent, cannot control teammate's state
             positiveGoal = [("defend_foods",)]
-            negtiveGoal = []
+            negtiveGoal += [
+                ("is_pacman", current_agent_obj),
+                # Removed: ("is_pacman", another_agent_obj) - cannot control teammate
+            ]
             print(f"Agent {self.index}: no invaders, set patrol goal")
 
         return positiveGoal, negtiveGoal
@@ -926,6 +989,17 @@ class MixedAgent(CaptureAgent):
             for e in enemies
             if not e.isPacman and e.getPosition() is not None and e.scaredTimer > 5
         ]
+
+        # ========== Priority 1: Emergency ghost avoidance ==========
+        # If ghost is very close (<=3 steps) and there are no scared ghosts, prioritize escaping
+        if ghosts and not scared_ghosts:
+            min_ghost_dist = min(self.getMazeDistance(myPos, g) for g in ghosts)
+            if min_ghost_dist <= 4:
+                # Ghost too close, escape immediately
+                print(
+                    f"Agent {self.index}: Ghost too close ({min_ghost_dist}), emergency escape"
+                )
+                return self._planEscape(gameState, myPos, walls, ghosts)
 
         if scared_ghosts:
             closest_scared = min(
@@ -1007,17 +1081,25 @@ class MixedAgent(CaptureAgent):
         for food in candidate_foods[:15]:  # Consider first 15
             food_dist = self.getMazeDistance(myPos, food)
 
-            # Calculate danger score
+            # Calculate danger score (increased weight for ghost proximity)
             danger_score = 0
             if ghosts:
                 min_ghost_dist = min(self.getMazeDistance(food, g) for g in ghosts)
-                danger_score = max(0, 10 - min_ghost_dist)
+                # Much higher penalty for close ghosts
+                if min_ghost_dist <= 2:
+                    danger_score = 200  # Extremely dangerous
+                elif min_ghost_dist <= 4:
+                    danger_score = 100  # Very dangerous
+                elif min_ghost_dist <= 6:
+                    danger_score = 50  # Dangerous
+                else:
+                    danger_score = max(0, 8 - min_ghost_dist) * 5  # Moderate danger
 
             # Calculate dead-end depth penalty
             deadend_penalty = self._getDeadEndDepth(food, walls)
 
-            # Comprehensive score
-            total_score = food_dist + danger_score * 3 + deadend_penalty * 2
+            # Comprehensive score (prioritize safety)
+            total_score = food_dist + danger_score * 5 + deadend_penalty * 2
 
             if total_score < best_score:
                 best_score = total_score
@@ -1038,6 +1120,18 @@ class MixedAgent(CaptureAgent):
     ) -> List[Tuple[str, Tuple]]:
         """Go home strategy: find nearest border line"""
         ghosts = self.getGhostLocs(gameState)
+
+        # ========== Priority 1: Emergency ghost avoidance ==========
+        # If ghost is very close (<=4 steps), prioritize escaping over going home
+        if ghosts:
+            min_ghost_dist = min(self.getMazeDistance(myPos, g) for g in ghosts)
+            if min_ghost_dist <= 4:
+                # Ghost too close, escape first
+                print(
+                    f"Agent {self.index}: Ghost too close ({min_ghost_dist}) while going home, emergency escape"
+                )
+                return self._planEscape(gameState, myPos, walls, ghosts)
+
         border_positions = (
             self.borderCoordinates if hasattr(self, "borderCoordinates") else []
         )
@@ -1050,7 +1144,7 @@ class MixedAgent(CaptureAgent):
                 (mid_x, y) for y in range(walls.height) if not walls[mid_x][y]
             ]
 
-        # Find safest border point
+        # Find safest border point (prioritize safety over distance)
         best_border = None
         best_score = float("inf")
 
@@ -1059,9 +1153,18 @@ class MixedAgent(CaptureAgent):
             danger_score = 0
             if ghosts:
                 min_ghost_dist = min(self.getMazeDistance(border, g) for g in ghosts)
-                danger_score = max(0, 6 - min_ghost_dist)
+                # Increase danger penalty: closer ghost = much higher penalty
+                if min_ghost_dist <= 2:
+                    danger_score = 200  # Extremely dangerous
+                elif min_ghost_dist <= 4:
+                    danger_score = 100  # Very dangerous
+                elif min_ghost_dist <= 6:
+                    danger_score = 50  # Dangerous
+                else:
+                    danger_score = max(0, 8 - min_ghost_dist) * 5  # Moderate danger
 
-            total_score = border_dist + danger_score * 3
+            # Prioritize safety: danger_score has much higher weight
+            total_score = border_dist + danger_score * 10
             if total_score < best_score:
                 best_score = total_score
                 best_border = border
@@ -1076,6 +1179,52 @@ class MixedAgent(CaptureAgent):
                 else self._getEmergencyMove(gameState, myPos, walls, ghosts)
             )
 
+        return self._getEmergencyMove(gameState, myPos, walls, ghosts)
+
+    def _planEscape(
+        self, gameState: GameState, myPos: Tuple, walls, ghosts: List[Tuple]
+    ) -> List[Tuple[str, Tuple]]:
+        """
+        Emergency escape strategy: when ghost is very close, find the safest direction
+        to maximize distance from all ghosts
+        """
+        if not ghosts:
+            # No ghosts, just go home normally
+            return self._planGoHome(gameState, myPos, walls)
+
+        legal_actions = gameState.getLegalActions(self.index)
+        legal_actions = [a for a in legal_actions if a != Directions.STOP]
+
+        if not legal_actions:
+            return [(Directions.STOP, myPos)]
+
+        # Find action that maximizes minimum distance to all ghosts
+        best_action = None
+        best_min_dist = -1
+
+        for action in legal_actions:
+            next_pos = Actions.getSuccessor(myPos, action)
+            # Calculate minimum distance to any ghost from next position
+            min_dist_to_ghost = min(self.getMazeDistance(next_pos, g) for g in ghosts)
+
+            # Also check if this position is in a dead-end (bad for escape)
+            neighbors = Actions.getLegalNeighbors(next_pos, walls)
+            deadend_penalty = 0
+            if len(neighbors) <= 2:
+                deadend_penalty = 2  # Penalize dead-ends
+
+            # Score: prioritize distance, penalize dead-ends
+            score = min_dist_to_ghost - deadend_penalty
+
+            if score > best_min_dist:
+                best_min_dist = score
+                best_action = action
+
+        if best_action:
+            next_pos = Actions.getSuccessor(myPos, best_action)
+            return [(best_action, next_pos)]
+
+        # Fallback: use emergency move
         return self._getEmergencyMove(gameState, myPos, walls, ghosts)
 
     def _planDefence(
@@ -1175,7 +1324,7 @@ class MixedAgent(CaptureAgent):
         # Ghost danger zone
         ghost_danger_zone = set()
         if avoid_ghosts and ghosts:
-            danger_radius = 3 if escape_mode else 2
+            danger_radius = 4 if escape_mode else 3
             for ghost in ghosts:
                 for dx in range(-danger_radius, danger_radius + 1):
                     for dy in range(-danger_radius, danger_radius + 1):
@@ -1250,7 +1399,10 @@ class MixedAgent(CaptureAgent):
                         self.getMazeDistance(next_pos, g) for g in ghosts
                     )
                     if min_ghost_dist <= 6:
-                        move_cost += 30
+                        if escape_mode:
+                            move_cost += 100  # Very high penalty when escaping through narrow area
+                        else:
+                            move_cost += 30  # High penalty in normal mode
 
                 # Avoid staying in place
                 if next_pos == current:
