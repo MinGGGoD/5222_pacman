@@ -108,10 +108,10 @@
     (:action patrol
         :parameters (?a - current_agent ?e1 - enemy1 ?e2 - enemy2)
         :precondition (and 
-            (not (is_pacman ?a))
+            (is_pacman ?a)
             (not (is_pacman ?e1))
             (not (is_pacman ?e2))
-            (winning)
+
         )
         :effect (and 
             (defend_foods)

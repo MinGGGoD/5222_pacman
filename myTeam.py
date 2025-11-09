@@ -119,6 +119,11 @@ class MixedAgent(CaptureAgent):
 
     # Also can use class variable to exchange information between agents.
     CURRENT_ACTION = {}
+    
+    # team-shared state
+    teamRoles = {}      # {index: "attack"/"defend"}
+    teamTargets = {}    # {index: (x, y) for current main target}
+    lastUpdateTurn = -1
 
 
     def registerInitialState(self, gameState: GameState):
@@ -186,6 +191,104 @@ class MixedAgent(CaptureAgent):
             file.write(str(MixedAgent.QLWeights))
             file.close()
     
+    def updateTeamState(self, gameState: GameState):
+        """
+        由队伍中 index 最小的那个 agent 调用：
+        - 决定谁攻谁守（写入 teamRoles）
+        - 如果有入侵者，调用 assignInvaders 分配防守目标（写入 teamTargets）
+        """
+        team = self.getTeam(gameState)
+        score = self.getScore(gameState)
+        timeLeft = gameState.data.timeleft
+
+        # --- 角色分工：一个攻一个守 / 双攻，简单但够用 ---
+        attacker = min(team)
+        defender = max(team)
+
+        # 情况 1：明显领先 & 时间不算多 -> 1 攻 1 守
+        if score >= 5 and timeLeft < 300:
+            MixedAgent.teamRoles[attacker] = "attack"
+            MixedAgent.teamRoles[defender] = "defend"
+
+        # 情况 2：平局/小落后且时间还多 -> 双攻
+        elif score <= 0 and timeLeft > 300:
+            for idx in team:
+                MixedAgent.teamRoles[idx] = "attack"
+
+        # 情况 3：严重落后 & 时间不多 -> 双攻 all-in
+        elif score < 0 and timeLeft < 150:
+            for idx in team:
+                MixedAgent.teamRoles[idx] = "attack"
+
+        # 其他情况：默认 1 攻 1 守
+        else:
+            MixedAgent.teamRoles[attacker] = "attack"
+            MixedAgent.teamRoles[defender] = "defend"
+
+        # --- 防守目标分配：只有在有人在守 & 有入侵者时才做 ---
+        enemies = [gameState.getAgentState(i) for i in self.getOpponents(gameState)]
+        invaders = [e for e in enemies if e.isPacman and e.getPosition() is not None]
+
+        # 先清空上一回合的分配，避免脏数据
+        MixedAgent.teamTargets.clear()
+
+        if not invaders:
+            return
+
+        # 看队伍里哪些 agent 是防守角色
+        defenders = [idx for idx in team if MixedAgent.teamRoles.get(idx) == "defend"]
+
+        if not defenders:
+            # 没有纯防守角色，比如双攻，就不做分配
+            return
+
+        # 目前最多就两人，防守人数 > 入侵者人数时，也只分配给防守的这几个
+        self.assignInvaders(gameState, defenders, invaders)
+
+
+    def assignInvaders(self, gameState: GameState, defenders, invaders):
+        """
+        根据 defender 和 invader 的位置，给每个 defender 分配一个拦截目标位置，
+        写入 MixedAgent.teamTargets。
+        defenders: [agentIndex, ...]  当前被标记为防守角色的 agent
+        invaders:  [AgentState, ...]  当前在我方半场的敌人
+        """
+        # 计算每个 defender 到每个 invader 的迷宫距离
+        dist = {}
+        for d in defenders:
+            dPos = gameState.getAgentState(d).getPosition()
+            for j, inv in enumerate(invaders):
+                dist[(d, j)] = self.getMazeDistance(dPos, inv.getPosition())
+
+        # 简单情况：只有一个入侵者 -> 分配给「最近的那个 defender」
+        if len(invaders) == 1:
+            j = 0
+            target_pos = invaders[0].getPosition()
+            best_def = min(defenders, key=lambda d: dist[(d, j)])
+            MixedAgent.teamTargets[best_def] = target_pos
+            return
+
+        # 常见情况：两个 defender + 两个入侵者，做一个最小总代价分配
+        if len(defenders) >= 2 and len(invaders) >= 2:
+            d0, d1 = defenders[0], defenders[1]
+            # 只考虑前两个 invader，足够用了
+            i0, i1 = 0, 1
+            d00 = dist[(d0, i0)] + dist[(d1, i1)]
+            d01 = dist[(d0, i1)] + dist[(d1, i0)]
+            if d00 <= d01:
+                MixedAgent.teamTargets[d0] = invaders[i0].getPosition()
+                MixedAgent.teamTargets[d1] = invaders[i1].getPosition()
+            else:
+                MixedAgent.teamTargets[d0] = invaders[i1].getPosition()
+                MixedAgent.teamTargets[d1] = invaders[i0].getPosition()
+            return
+
+        # 其他奇怪人数搭配（比如 1 守多入侵者），就先简单一点：每个 defender 追最近 invader
+        for d in defenders:
+            best_j = min(range(len(invaders)), key=lambda j: dist[(d, j)])
+            MixedAgent.teamTargets[d] = invaders[best_j].getPosition()
+
+
 
     def chooseAction(self, gameState: GameState):
         """
@@ -195,6 +298,12 @@ class MixedAgent(CaptureAgent):
         We first pick a high-level action.
         Then generate low-level action ("North", "South", "East", "West", "Stop") to achieve the high-level action.
         """
+        
+        # ---------- 队长更新全队状态（角色 + 防守目标分配） ----------
+        team = self.getTeam(gameState)
+        leader = min(team)
+        if self.index == leader:
+            self.updateTeamState(gameState)
 
         #-------------High Level Plan Section-------------------
         # Get high level action from a pddl plan.
@@ -568,11 +677,6 @@ class MixedAgent(CaptureAgent):
                 negtiveGoal += [("is_pacman", "a{}".format(i))]
             return positiveGoal, negtiveGoal
         
-        # ==================== 优先级4.1: 如果离地人比较近, 转防守 ==========
-        if ('enemy_around',) in initState:
-            print(f'Agent {self.index}: 检测到敌人, 转防守')
-            return self.goalDefWinning(objects, initState)
-        
         # ==================== 优先级5: 默认进攻 ====================
         # 检查是否应该更激进（落后时）
         if currentScore < -3 and timeRemaining > 400:
@@ -622,6 +726,7 @@ class MixedAgent(CaptureAgent):
         has_invader = False
         negtiveGoal = []
         
+        # default eat enemies
         for obj in objects:
             agent_obj = obj[0]
             agent_type = obj[1]
@@ -637,13 +742,13 @@ class MixedAgent(CaptureAgent):
             # 有入侵者：使用defence action消除入侵者
             positiveGoal = []
             # negtiveGoal已经设置：要求所有入侵的敌人不是pacman
-            print(f'Agent {self.index}: 检测到入侵者，设置defence goal: {negtiveGoal}')
+            print(f'Agent {self.index}: 检测到入侵者,设置defence goal: {negtiveGoal}')
         else:
             # 没有入侵者：使用patrol action巡逻
             positiveGoal = [("defend_foods",)]
             negtiveGoal = []
-            print(f'Agent {self.index}: 没有入侵者，设置patrol goal')
-        
+            print(f'Agent {self.index}: 没有入侵者,设置patrol goal')
+            
         return positiveGoal, negtiveGoal
     
     
@@ -732,12 +837,30 @@ class MixedAgent(CaptureAgent):
         # 如果所有食物都不安全，就选择危险度最低的
         if not safe_foods:
             safe_foods = target_foods
+            
+        # ========= 浅/深分工（基于死胡同深度） =========
+        team = self.getTeam(gameState)
+        is_shallow_runner = (self.index == min(team))  # index 小的负责浅层，index 大的负责深层
+        depth_limit = 5  # 阈值：<= 5 认为是“浅”、> 5 认为是“深”，你可以之后自己调
+
+        # 先按照死胡同深度把 safe_foods 划分
+        if is_shallow_runner:
+            # 浅层搬运工：优先吃浅的，路线安全 + 回家快
+            candidate_foods = [f for f in safe_foods if self._getDeadEndDepth(f, walls) <= depth_limit]
+            if not candidate_foods:
+                # 全是深坑，那就硬着头皮在 safe_foods 里挑
+                candidate_foods = safe_foods
+        else:
+            # 深度刺客：优先吃深的（一般配合 capsule / scared ghost 更赚）
+            candidate_foods = [f for f in safe_foods if self._getDeadEndDepth(f, walls) > depth_limit]
+            if not candidate_foods:
+                candidate_foods = safe_foods
         
         # 找到最优食物
         best_food = None
         best_score = float('inf')
         
-        for food in safe_foods[:15]:  # 考虑前15个
+        for food in candidate_foods[:15]:  # 考虑前15个
             food_dist = self.getMazeDistance(myPos, food)
             
             # 计算危险度
@@ -798,17 +921,36 @@ class MixedAgent(CaptureAgent):
 
 
     def _planDefence(self, gameState: GameState, myPos: Tuple, walls) -> List[Tuple[str, Tuple]]:
-        """防守策略：拦截入侵者"""
+        """防守策略：拦截入侵者（支持 teamTargets 协同）"""
         enemies = [gameState.getAgentState(i) for i in self.getOpponents(gameState)]
         invaders = [e for e in enemies if e.isPacman and e.getPosition() is not None]
-        
+
+        # ---------- 1. 如果有分配的目标，优先去 assigned_target ----------
+        assigned_target = MixedAgent.teamTargets.get(self.index, None)
+
+        if assigned_target is not None:
+            invader_positions = {e.getPosition() for e in invaders if e.getPosition() is not None}
+            # 目标仍对应某个 invader，或者至少还有 invaders 存在
+            if assigned_target in invader_positions or invaders:
+                path = self._astar(myPos, assigned_target, walls, [], avoid_ghosts=False)
+                if path:
+                    return path
+            # 目标走不到 / 已经无效 -> 删掉，退回默认逻辑
+            MixedAgent.teamTargets.pop(self.index, None)
+
+        # ---------- 2. 没有有效分配：用最近入侵者逻辑 ----------
         if invaders:
             closest_invader = min(invaders, key=lambda e: self.getMazeDistance(myPos, e.getPosition()))
             target = closest_invader.getPosition()
             path = self._astar(myPos, target, walls, [], avoid_ghosts=False)
-            return path if path else self._getEmergencyMove(gameState, myPos, walls, [])
-        else:
-            return self._planPatrol(gameState, myPos, walls)
+            if path:
+                return path
+            # 找不到路，至少做个紧急动作
+            return self._getEmergencyMove(gameState, myPos, walls, [])
+
+        # ---------- 3. 完全没有入侵者：清理自己的目标 & 巡逻 ----------
+        MixedAgent.teamTargets.pop(self.index, None)
+        return self._planPatrol(gameState, myPos, walls)
 
 
     def _planPatrol(self, gameState: GameState, myPos: Tuple, walls) -> List[Tuple[str, Tuple]]:
@@ -824,7 +966,7 @@ class MixedAgent(CaptureAgent):
             border_positions = [(mid_x, y) for y in range(walls.height) if not walls[mid_x][y]]
         
         # 选择距离在5-15之间的巡逻点
-        patrol_targets = [b for b in border_positions if 5 <= self.getMazeDistance(myPos, b) <= 15]
+        patrol_targets = [b for b in border_positions if 5 <= self.getMazeDistance(myPos, b) <= 10]
         
         if not patrol_targets:
             patrol_targets = border_positions
@@ -899,7 +1041,7 @@ class MixedAgent(CaptureAgent):
                 
                 # Ghost危险区域增加代价
                 if next_pos in ghost_danger_zone:
-                    move_cost += 50 if escape_mode else 10
+                    move_cost += 50 if escape_mode else 1
                 
                 # ========== 死胡同惩罚 ==========
                 if next_pos in deadend_zones:
@@ -908,7 +1050,7 @@ class MixedAgent(CaptureAgent):
                         move_cost += 5  # 轻微惩罚
                     else:
                         # 否则大幅增加代价
-                        move_cost += 100
+                        move_cost += 50
                 
                 # 检查是否进入死路（邻居很少）
                 neighbors = Actions.getLegalNeighbors(next_pos, walls)
