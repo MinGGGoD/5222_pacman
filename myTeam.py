@@ -648,9 +648,12 @@ class MixedAgent(CaptureAgent):
         walls = gameState.getWalls()
 
         # Check if carrying enough food (is not dangerous keep eating food)
-        has_enemy_around = any(
-            fact[0] == "enemy_around" and fact[2] == myObj for fact in initState
-        )
+        # Find all enemy_around facts related to the current agent
+        enemy_around_facts = [
+            fact for fact in initState
+            if fact[0] == "enemy_around" and fact[2] == myObj
+        ]
+        has_enemy_around = len(enemy_around_facts) > 0
         if ("greedy_eat_food", myObj) in initState:
             # safe to eat food
             myCarrierGoal = False
@@ -765,6 +768,21 @@ class MixedAgent(CaptureAgent):
                     positiveGoal = []
                     negtiveGoal = [("is_pacman", myObj)]
                     return positiveGoal, negtiveGoal
+
+
+        # Ghost detection - trigger go home strategy when enemy is nearby
+        # Only trigger go_home when agent is currently pacman (because go_home action requires is_pacman precondition)
+        if has_enemy_around and cur_agent_state.isPacman:
+            print(f"Agent {self.index}: enemy around and is pacman, return home")
+            positiveGoal = []
+            # Build negtiveGoal: need to not be pacman (effect of go_home action)
+            # enemy_around state will be automatically updated as agent moves, no need to specify in negtiveGoal
+            negtiveGoal = [("is_pacman", myObj)]
+            return positiveGoal, negtiveGoal
+        elif has_enemy_around and not cur_agent_state.isPacman:
+            # If agent is already at home (not pacman), switch to defense strategy when enemy is nearby
+            print(f"Agent {self.index}: enemy around but already at home, switch to defense")
+            return self.goalDefWinning(objects, initState)
 
         # ==================== Priority 2: Carrying food check ====================
         # When time is sufficient, return home with 3 food
@@ -971,6 +989,28 @@ class MixedAgent(CaptureAgent):
         )
         if nextPos != self.lowLevelPlan[self.lowLevelActionIndex][1]:
             return False
+        
+        # Check if there are ghosts on the path (including predicted positions within future steps)
+        ghosts = self.getGhostLocs(gameState)
+        ghost_future_positions = self.getGhostFuturePositions(gameState, steps=3)
+        
+        # Merge current ghost positions and future possible positions
+        all_ghost_positions = set(ghosts) | ghost_future_positions
+        
+        if all_ghost_positions:
+            # Check if next position has a ghost (direct collision or will be reached in future)
+            if nextPos in all_ghost_positions:
+                return False
+            
+            # Check if there are ghosts on the entire low-level plan path (check up to 4 future steps)
+            check_steps = min(4, len(self.lowLevelPlan) - self.lowLevelActionIndex)
+            for i in range(self.lowLevelActionIndex, self.lowLevelActionIndex + check_steps):
+                if i >= len(self.lowLevelPlan):
+                    break
+                plannedPos = self.lowLevelPlan[i][1]
+                if plannedPos in all_ghost_positions:
+                    return False
+        
         return True
 
     # ------------------------------- Heuristic search strategies Functions -------------------------------#
@@ -2231,6 +2271,51 @@ class MixedAgent(CaptureAgent):
                 if opPos and not opIsPacman:
                     ghosts.append(opPos)
         return ghosts
+
+    def getGhostFuturePositions(self, gameState: GameState, steps: int = 4):
+        """
+        Predict all possible positions that ghosts may reach within future steps
+        Use BFS to explore all possible paths
+        """
+        future_positions = set()
+        opAgents = CaptureAgent.getOpponents(self, gameState)
+        walls = gameState.getWalls()
+        
+        if not opAgents:
+            return future_positions
+        
+        for opponent in opAgents:
+            opState = gameState.getAgentState(opponent)
+            opPos = opState.getPosition()
+            opIsPacman = opState.isPacman
+            
+            # Only predict positions of ghosts (non-pacman)
+            if opPos is None or opIsPacman:
+                continue
+            
+            # Use BFS to explore all possible positions within future steps
+            queue = [(opPos, 0)]  # (position, steps_taken)
+            visited_positions = {opPos}  # Record all visited positions, initial position already visited
+            
+            while queue:
+                current_pos, steps_taken = queue.pop(0)
+                
+                # Add current position to prediction set
+                future_positions.add(current_pos)
+                
+                if steps_taken >= steps:
+                    continue
+                
+                # Get all legal neighbors of current position (simulate ghost movement)
+                neighbors = Actions.getLegalNeighbors(current_pos, walls)
+                
+                # Explore all possible next steps
+                for next_pos in neighbors:
+                    if next_pos not in visited_positions:
+                        visited_positions.add(next_pos)
+                        queue.append((next_pos, steps_taken + 1))
+        
+        return future_positions
 
     def getDistanceToBorder(self, pos):
         """
